@@ -174,6 +174,8 @@ def find_fixed_target_track(
     if not detections:
         return {
             "detections": 0,
+            "items": [],
+            "matched_items": [],
             "matched_frames": [],
             "first_frame": None,
             "last_frame": None,
@@ -236,6 +238,8 @@ def find_fixed_target_track(
 
     return {
         "detections": len(detections),
+        "items": detections,
+        "matched_items": detections,
         "matched_frames": [item["frame_idx"] for item in detections],
         "first_frame": detections[0]["frame_idx"],
         "last_frame": detections[-1]["frame_idx"],
@@ -291,23 +295,43 @@ def analyze_two_target_resolution(
     longest_unresolved_run = None
     unresolved_frames = []
     resolved_frames = []
+    resolved_target_items = []
     resolved_frame_count = 0
     resolved_ranges = []
 
     for frame_idx, frame in enumerate(frames, start=1):
-        candidates = []
-        for obj in frame.get("objects", []):
-            for expected_range in expected_ranges:
-                if abs(obj.dist_long - expected_range) <= matching_range_tolerance:
-                    candidates.append(obj)
-                    break
+        frame_matches = []
+        used_object_indices = set()
+        for target_index, expected_range in enumerate(expected_ranges, start=1):
+            candidates = []
+            for obj_index, obj in enumerate(frame.get("objects", [])):
+                if obj_index in used_object_indices:
+                    continue
+                range_error = abs(obj.dist_long - expected_range)
+                if range_error <= matching_range_tolerance:
+                    candidates.append((range_error, obj_index, obj))
+            if not candidates:
+                continue
+            range_error, obj_index, obj = min(candidates, key=lambda item: item[0])
+            used_object_indices.add(obj_index)
+            frame_matches.append(
+                {
+                    "frame_idx": frame_idx,
+                    "target_index": target_index,
+                    "expected_range": expected_range,
+                    "object": obj,
+                    "frame": frame,
+                    "range_error": range_error,
+                }
+            )
 
-        if len(candidates) >= 2:
+        if len(frame_matches) >= 2:
             consecutive_unresolved = 0
             current_unresolved_start = None
             resolved_frame_count += 1
             resolved_frames.append(frame_idx)
-            resolved_ranges.append(tuple(sorted(obj.dist_long for obj in candidates[:2])))
+            resolved_ranges.append(tuple(sorted(item["object"].dist_long for item in frame_matches[:2])))
+            resolved_target_items.extend(frame_matches[:2])
             continue
 
         if consecutive_unresolved == 0:
@@ -327,6 +351,7 @@ def analyze_two_target_resolution(
         "frame_count": len(frames),
         "resolved_frame_count": resolved_frame_count,
         "resolved_frames": resolved_frames,
+        "resolved_target_items": resolved_target_items,
         "unresolved_frame_count": len(unresolved_frames),
         "unresolved_frames": unresolved_frames,
         "max_consecutive_unresolved": max_consecutive_unresolved,
@@ -349,6 +374,7 @@ def analyze_two_target_speed_resolution(
     longest_unresolved_run = None
     unresolved_frames = []
     resolved_frames = []
+    resolved_target_items = []
     resolved_frame_count = 0
     resolved_speeds = []
 
@@ -356,14 +382,28 @@ def analyze_two_target_speed_resolution(
         candidates = []
         for obj in frame.get("objects", []):
             if abs(obj.dist_long - target_range) <= matching_range_tolerance:
-                candidates.append(obj)
+                candidates.append((abs(obj.dist_long - target_range), obj))
 
         if len(candidates) >= 2:
             consecutive_unresolved = 0
             current_unresolved_start = None
             resolved_frame_count += 1
             resolved_frames.append(frame_idx)
-            resolved_speeds.append(tuple(sorted(abs(obj.vre_long) for obj in candidates[:2])))
+            selected = [obj for _, obj in sorted(candidates, key=lambda item: item[0])[:2]]
+            selected_by_speed = sorted(selected, key=lambda obj: abs(obj.vre_long))
+            resolved_speeds.append(tuple(sorted(abs(obj.vre_long) for obj in selected)))
+            for target_index, obj in enumerate(selected_by_speed, start=1):
+                expected_speed = expected_speeds[min(target_index - 1, len(expected_speeds) - 1)]
+                resolved_target_items.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "target_index": target_index,
+                        "expected_range": target_range,
+                        "expected_speed": expected_speed,
+                        "object": obj,
+                        "frame": frame,
+                    }
+                )
             continue
 
         if consecutive_unresolved == 0:
@@ -383,6 +423,7 @@ def analyze_two_target_speed_resolution(
         "frame_count": len(frames),
         "resolved_frame_count": resolved_frame_count,
         "resolved_frames": resolved_frames,
+        "resolved_target_items": resolved_target_items,
         "unresolved_frame_count": len(unresolved_frames),
         "unresolved_frames": unresolved_frames,
         "max_consecutive_unresolved": max_consecutive_unresolved,
@@ -463,6 +504,7 @@ def analyze_speed_sweep_coverage(
             "covered_speed_max": None,
             "missing_speed_bins": [],
             "speed_range_pass": False,
+            "matched_frames": [],
             "matched_items": [],
         }
 

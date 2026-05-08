@@ -85,12 +85,12 @@ pip install RsInstrument psutil pywinauto pywin32
 
 | 文件名 | 场景 | 内容 |
 | --- | --- | --- |
-| `fixed_target_analysis_*.log` | 静态单目标 `F*` | 连续性、距离或速度误差、角度显示、点云数量、报警摘要。 |
-| `max_distance_analysis_*.log` | 远离动态目标 | 最远丢失距离、最远检测距离、横向稳定性、点云数量、报警信息。 |
-| `approaching_target_analysis_*.log` | 接近动态目标 | 接近轨迹摘要、点云数量、基于目标对象的报警区间。 |
-| `speed_sweep_analysis_*.log` | `D7` 测速范围 | 测速覆盖范围、缺失速度桶、点云数量。 |
-| `multi_target_resolution_analysis_*.log` | `M1` | 距离分辨率二分法结果。 |
-| `multi_target_speed_resolution_analysis_*.log` | `M2` | 速度分辨率二分法结果。 |
+| `fixed_target_analysis_*.log` | 静态单目标 `F*` | 连续性、距离/速度/角度容差、横纵向距离误差、速度误差、角度偏差、点云数量、报警摘要。 |
+| `max_distance_analysis_*.log` | 远离动态目标 | 最远丢失距离、最远检测距离、建航时间、点云连续性、横向稳定性、横纵向距离误差、速度误差、角度偏差、点云数量、报警信息。 |
+| `approaching_target_analysis_*.log` | 接近动态目标 | 接近轨迹摘要、完整周期 object 建航/消失距离、建航时间、点云连续性、横纵向距离误差、速度误差、角度偏差、基于目标对象的报警区间。 |
+| `speed_sweep_analysis_*.log` | `D7` 测速范围 | 测速覆盖范围、缺失速度桶、建航时间、点云连续性、横纵向距离误差、速度误差、角度偏差、点云数量。 |
+| `multi_target_resolution_analysis_*.log` | `M1` | 距离分辨率二分法结果、点云连续性、横纵向距离误差、速度误差、角度偏差。 |
+| `multi_target_speed_resolution_analysis_*.log` | `M2` | 速度分辨率二分法结果、点云连续性、横纵向距离误差、速度误差、角度偏差。 |
 
 日志采用中英双语格式，例如：
 
@@ -114,6 +114,13 @@ pip install RsInstrument psutil pywinauto pywin32
 - 点云连续，无间断，无连续 `3` 帧丢失。
 - 读取速度与模拟器设置速度误差在 `+/-0.1m/s` 以内。
 - 点云数量应等于 `2`。
+
+所有静态单目标日志还会额外输出公共误差项：
+
+- 纵向距离误差，默认阈值 `+/-1.75m`。
+- 横向距离误差，默认阈值 `+/-1.75m`。
+- 速度误差，默认阈值 `+/-0.3m/s`。
+- 角度偏差估计，以及各类最大误差位置与计算式。
 
 角度说明：
 
@@ -149,7 +156,10 @@ pip install RsInstrument psutil pywinauto pywin32
 远离动态场景会输出：
 
 - 每个周期的目标轨迹、丢失帧、最远检测距离和最远丢失距离。
+- 建航时间总结果与每个周期建航明细。
+- 点云连续性总结果，以及“无连续 `3` 帧丢失”检查结果。
 - 横向稳定性摘要。
+- 横纵向距离误差、速度误差和角度偏差估计。
 - 点云数量检查。
 - 报警信息。
 
@@ -168,11 +178,30 @@ pip install RsInstrument psutil pywinauto pywin32
 - 如果既有 `stable` 周期，也有非 `stable` 周期，日志输出 `mixed results, X stable cycle(s), Y unstable cycle(s)`。
 - 如果所有周期都不是 `stable`，日志输出“所有周期都存在明显横向漂移或抖动”。
 
+动态建航与连续性规则：
+
+- 建航时间 `<= 3` 帧，定义为“点云首次出现后，对应 object 在 `3` 帧内生成”。
+- 点云连续性明细会输出每个周期的 `frames`、`matched_frames`、`missing_frames`、`max_consecutive_missing`。
+- `3-frame loss overall` 表示目标点出现后，周期内部没有连续 `3` 帧未检测到目标点。
+
+动态公共误差规则：
+
+- 纵向距离误差默认阈值为 `+/-1.75m`。
+- 横向距离误差默认阈值为 `+/-1.75m`。
+- 速度误差默认阈值为 `+/-0.3m/s`。
+- 动态场景的期望纵向轨迹按“首次匹配目标距离 + 配置速度 × 0.1s × 帧差”计算。
+- 期望横向距离默认按目标正前方 `0m` 计算；如果场景配置了角度，则按配置角度换算横向期望值。
+- 如果同一帧能匹配到 object，则优先使用 `Object.DistLong / Object.DistLat / Object.VreLong` 计算误差；否则回退到 `Point.Range / Point.AngleAZ / Point.Velocity`。
+- 日志会输出最大纵向误差、最大横向误差、最大速度误差、最大角度偏差的具体位置和 `actual - expected = error` 计算式。
+- 角度偏差估计基于目标理论正前方 `0deg`，输出 `avg_bias`、`max_abs_error`、`avg_abs_error` 和误差范围。
+
 ### 动态接近目标
 
 接近动态场景会输出：
 
 - 每个周期的起始检测距离、最近检测距离、速度和横向稳定性。
+- 每个完整周期的 `object_build_distance` 和 `object_disappear_distance`，以及跨周期汇总。
+- 建航时间、点云连续性、横纵向距离误差、速度误差和角度偏差。
 - 点云数量检查。
 - 报警区间。
 
@@ -198,6 +227,29 @@ pip install RsInstrument psutil pywinauto pywin32
 - 按 `1m/s` 作为速度桶。
 - 需要覆盖完整区间且中间无缺失速度桶。
 - 点云数量期望为 `2`。
+- 同时输出公共的建航时间、点云连续性、横纵向距离误差、速度误差和角度偏差日志。
+
+### 日志中的公共误差项
+
+所有自动分析日志现在都会补充以下公共字段：
+
+- `Longitudinal distance error check`
+- `Max longitudinal error detail`
+- `Lateral distance error check`
+- `Max lateral error detail`
+- `Velocity error check`
+- `Max velocity error detail`
+- `Angle bias estimate`
+- `Max angle bias detail`
+
+其中 `Max ... detail` 会直接给出：
+
+- `frame`
+- `cycle` 或 `target`
+- `source`（`point` 或 `object`）
+- `actual`
+- `expected`
+- `calculation=actual - expected = error`
 
 ## 代码文件 | Source Files
 
@@ -215,5 +267,6 @@ pip install RsInstrument psutil pywinauto pywin32
 
 - 旧日志不会自动更新。修改分析逻辑后，需要重新录制或重新触发分析才会生成新格式日志。
 - `frame.txt` 中 `[Point]` 表示点云点，`[Object]` 表示目标对象。多目标分辨率和动态报警优先使用 `[Object]`。
+- 误差日志中的 `source=object` 表示该帧成功匹配到了 object，误差按 `DistLong/DistLat/VreLong` 计算；`source=point` 表示未匹配到 object，按点云字段回退计算。
 - 点云数量规则来自暗箱测试口径：理论点云数量为 `虚拟目标数 + 1 个金属目标`。
 - 自动模式依赖 Windows UI 自动化，运行前请确认 Quectel 上位机路径和控件 ID 与当前版本一致。

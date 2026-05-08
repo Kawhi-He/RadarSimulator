@@ -18,6 +18,8 @@ from radar_simulator import DEFAULT_IP, RadarTargetSimulator
 
 Selection = tuple[str, int]
 DEFAULT_TRACK_BUILD_FRAME_LIMIT = 3
+DEFAULT_LONGITUDINAL_DISTANCE_ERROR_TOLERANCE_M = 1.75
+DEFAULT_VELOCITY_ERROR_TOLERANCE_MPS = 0.3
 LATERAL_STABILITY_CRITERIA = (
     "if min_angle < -0.15deg and max_angle > 0.15deg -> left-right crossing; "
     "else if angle_span > 0.3deg or angle_std > 0.12deg -> noticeable jitter; "
@@ -195,6 +197,486 @@ def dynamic_track_build_frame_limit(scenario: Mapping[str, Any]) -> int:
     return int(scenario.get("track_build_frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT))
 
 
+def scenario_longitudinal_tolerance(scenario: Mapping[str, Any]) -> float:
+    return float(
+        scenario.get(
+            "longitudinal_distance_error_tolerance_m",
+            DEFAULT_LONGITUDINAL_DISTANCE_ERROR_TOLERANCE_M,
+        )
+    )
+
+
+def scenario_lateral_tolerance(scenario: Mapping[str, Any]) -> float:
+    return float(
+        scenario.get(
+            "lateral_distance_error_tolerance_m",
+            scenario_longitudinal_tolerance(scenario),
+        )
+    )
+
+
+def scenario_velocity_tolerance(scenario: Mapping[str, Any]) -> float:
+    return float(
+        scenario.get(
+            "velocity_error_tolerance_mps",
+            DEFAULT_VELOCITY_ERROR_TOLERANCE_MPS,
+        )
+    )
+
+
+def _angle_to_degrees(angle: float, angle_unit: str = "deg") -> float:
+    return math.degrees(angle) if angle_unit == "rad" else angle
+
+
+def _expected_lateral_from_angle(range_m: float, angle: float, angle_unit: str = "deg") -> float:
+    return range_m * math.sin(math.radians(_angle_to_degrees(angle, angle_unit=angle_unit)))
+
+
+def _point_lateral(point: Any, angle_unit: str = "deg") -> float:
+    return point.range_m * math.sin(math.radians(_angle_to_degrees(point.angle_az, angle_unit=angle_unit)))
+
+
+def _point_angle_deg(point: Any, angle_unit: str = "deg") -> float:
+    return _angle_to_degrees(point.angle_az, angle_unit=angle_unit)
+
+
+def _object_angle_deg(obj: Any) -> float:
+    return math.degrees(math.atan2(float(obj.dist_lat), float(obj.dist_long)))
+
+
+def _expected_angle_deg(angle: float, angle_unit: str = "deg") -> float:
+    return _angle_to_degrees(angle, angle_unit=angle_unit)
+
+
+def _round_or_none(value: float | None, digits: int = 3) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
+def _empty_distance_error_result(
+    longitudinal_tolerance_m: float,
+    lateral_tolerance_m: float | None,
+) -> dict[str, Any]:
+    return {
+        "sample_count": 0,
+        "longitudinal_tolerance_m": longitudinal_tolerance_m,
+        "lateral_tolerance_m": lateral_tolerance_m,
+        "longitudinal_pass": False,
+        "lateral_pass": None if lateral_tolerance_m is None else False,
+        "velocity_tolerance_mps": DEFAULT_VELOCITY_ERROR_TOLERANCE_MPS,
+        "velocity_pass": False,
+        "overall_pass": False,
+        "max_abs_longitudinal_error_m": None,
+        "avg_abs_longitudinal_error_m": None,
+        "min_longitudinal_error_m": None,
+        "max_longitudinal_error_m": None,
+        "max_abs_lateral_error_m": None,
+        "avg_abs_lateral_error_m": None,
+        "min_lateral_error_m": None,
+        "max_lateral_error_m": None,
+        "max_abs_velocity_error_mps": None,
+        "avg_abs_velocity_error_mps": None,
+        "min_velocity_error_mps": None,
+        "max_velocity_error_mps": None,
+        "max_longitudinal_error_sample": None,
+        "max_lateral_error_sample": None,
+        "max_velocity_error_sample": None,
+        "details": [],
+    }
+
+
+def _format_distance_error_sample(sample: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "frame_idx": sample.get("frame_idx"),
+        "cycle_index": sample.get("cycle_index"),
+        "target_index": sample.get("target_index"),
+        "source": sample.get("source"),
+        "actual_longitudinal_m": round(float(sample["actual_longitudinal_m"]), 3),
+        "expected_longitudinal_m": round(float(sample["expected_longitudinal_m"]), 3),
+        "longitudinal_error_m": round(float(sample["longitudinal_error_m"]), 3),
+        "actual_lateral_m": round(float(sample["actual_lateral_m"]), 3),
+        "expected_lateral_m": round(float(sample["expected_lateral_m"]), 3),
+        "lateral_error_m": round(float(sample["lateral_error_m"]), 3),
+        "actual_velocity_mps": round(float(sample["actual_velocity_mps"]), 3),
+        "expected_velocity_mps": round(float(sample["expected_velocity_mps"]), 3),
+        "velocity_error_mps": round(float(sample["velocity_error_mps"]), 3),
+        "actual_angle_deg": round(float(sample["actual_angle_deg"]), 3),
+        "expected_angle_deg": round(float(sample["expected_angle_deg"]), 3),
+        "angle_error_deg": round(float(sample["angle_error_deg"]), 3),
+    }
+
+
+def summarize_distance_error_samples(
+    samples: list[Mapping[str, Any]],
+    longitudinal_tolerance_m: float,
+    lateral_tolerance_m: float | None = None,
+    velocity_tolerance_mps: float = DEFAULT_VELOCITY_ERROR_TOLERANCE_MPS,
+) -> dict[str, Any]:
+    if not samples:
+        result = _empty_distance_error_result(longitudinal_tolerance_m, lateral_tolerance_m)
+        result["velocity_tolerance_mps"] = velocity_tolerance_mps
+        return result
+
+    long_errors = [float(sample["longitudinal_error_m"]) for sample in samples]
+    lat_errors = [float(sample["lateral_error_m"]) for sample in samples]
+    velocity_errors = [float(sample["velocity_error_mps"]) for sample in samples]
+    angle_errors = [float(sample["angle_error_deg"]) for sample in samples]
+    abs_long_errors = [abs(error) for error in long_errors]
+    abs_lat_errors = [abs(error) for error in lat_errors]
+    abs_velocity_errors = [abs(error) for error in velocity_errors]
+    abs_angle_errors = [abs(error) for error in angle_errors]
+    longitudinal_pass = max(abs_long_errors) <= longitudinal_tolerance_m
+    lateral_pass = (
+        max(abs_lat_errors) <= lateral_tolerance_m
+        if lateral_tolerance_m is not None
+        else None
+    )
+    velocity_pass = max(abs_velocity_errors) <= velocity_tolerance_mps
+    overall_pass = longitudinal_pass and velocity_pass and (lateral_pass is not False)
+    max_longitudinal_sample = max(samples, key=lambda sample: abs(float(sample["longitudinal_error_m"])))
+    max_lateral_sample = max(samples, key=lambda sample: abs(float(sample["lateral_error_m"])))
+    max_velocity_sample = max(samples, key=lambda sample: abs(float(sample["velocity_error_mps"])))
+    max_angle_sample = max(samples, key=lambda sample: abs(float(sample["angle_error_deg"])))
+    detail_samples = []
+    for sample in samples[:20]:
+        detail_samples.append(_format_distance_error_sample(sample))
+
+    return {
+        "sample_count": len(samples),
+        "longitudinal_tolerance_m": longitudinal_tolerance_m,
+        "lateral_tolerance_m": lateral_tolerance_m,
+        "longitudinal_pass": longitudinal_pass,
+        "lateral_pass": lateral_pass,
+        "velocity_tolerance_mps": velocity_tolerance_mps,
+        "velocity_pass": velocity_pass,
+        "overall_pass": overall_pass,
+        "max_abs_longitudinal_error_m": round(max(abs_long_errors), 3),
+        "avg_abs_longitudinal_error_m": round(sum(abs_long_errors) / len(abs_long_errors), 3),
+        "min_longitudinal_error_m": round(min(long_errors), 3),
+        "max_longitudinal_error_m": round(max(long_errors), 3),
+        "max_abs_lateral_error_m": round(max(abs_lat_errors), 3),
+        "avg_abs_lateral_error_m": round(sum(abs_lat_errors) / len(abs_lat_errors), 3),
+        "min_lateral_error_m": round(min(lat_errors), 3),
+        "max_lateral_error_m": round(max(lat_errors), 3),
+        "max_abs_velocity_error_mps": round(max(abs_velocity_errors), 3),
+        "avg_abs_velocity_error_mps": round(sum(abs_velocity_errors) / len(abs_velocity_errors), 3),
+        "min_velocity_error_mps": round(min(velocity_errors), 3),
+        "max_velocity_error_mps": round(max(velocity_errors), 3),
+        "avg_angle_bias_deg": round(sum(angle_errors) / len(angle_errors), 3),
+        "max_abs_angle_error_deg": round(max(abs_angle_errors), 3),
+        "avg_abs_angle_error_deg": round(sum(abs_angle_errors) / len(abs_angle_errors), 3),
+        "min_angle_error_deg": round(min(angle_errors), 3),
+        "max_angle_error_deg": round(max(angle_errors), 3),
+        "max_longitudinal_error_sample": _format_distance_error_sample(max_longitudinal_sample),
+        "max_lateral_error_sample": _format_distance_error_sample(max_lateral_sample),
+        "max_velocity_error_sample": _format_distance_error_sample(max_velocity_sample),
+        "max_angle_error_sample": _format_distance_error_sample(max_angle_sample),
+        "details": detail_samples,
+    }
+
+
+def _sample_from_point_item(
+    item: Mapping[str, Any],
+    expected_longitudinal_m: float,
+    expected_lateral_m: float,
+    expected_velocity_mps: float,
+    *,
+    cycle_index: int | None = None,
+    target_index: int | None = None,
+    angle_unit: str = "deg",
+) -> dict[str, Any] | None:
+    point = item.get("point")
+    if point is None:
+        return None
+    expected_angle = math.degrees(math.atan2(expected_lateral_m, expected_longitudinal_m)) if expected_longitudinal_m else 0.0
+    matched_object = _match_object_for_point_item(item)
+    if matched_object is not None:
+        actual_longitudinal = float(matched_object.dist_long)
+        actual_lateral = float(matched_object.dist_lat)
+        actual_velocity = float(matched_object.vre_long)
+        actual_angle = _object_angle_deg(matched_object)
+        return {
+            "frame_idx": item.get("frame_idx"),
+            "cycle_index": cycle_index,
+            "target_index": target_index,
+            "source": "object",
+            "actual_longitudinal_m": actual_longitudinal,
+            "expected_longitudinal_m": expected_longitudinal_m,
+            "longitudinal_error_m": actual_longitudinal - expected_longitudinal_m,
+            "actual_lateral_m": actual_lateral,
+            "expected_lateral_m": expected_lateral_m,
+            "lateral_error_m": actual_lateral - expected_lateral_m,
+            "actual_velocity_mps": actual_velocity,
+            "expected_velocity_mps": expected_velocity_mps,
+            "velocity_error_mps": actual_velocity - expected_velocity_mps,
+            "actual_angle_deg": actual_angle,
+            "expected_angle_deg": expected_angle,
+            "angle_error_deg": actual_angle - expected_angle,
+        }
+    actual_longitudinal = float(point.range_m)
+    actual_lateral = _point_lateral(point, angle_unit=angle_unit)
+    actual_velocity = float(point.velocity)
+    actual_angle = _point_angle_deg(point, angle_unit=angle_unit)
+    return {
+        "frame_idx": item.get("frame_idx"),
+        "cycle_index": cycle_index,
+        "target_index": target_index,
+        "source": "point",
+        "actual_longitudinal_m": actual_longitudinal,
+        "expected_longitudinal_m": expected_longitudinal_m,
+        "longitudinal_error_m": actual_longitudinal - expected_longitudinal_m,
+        "actual_lateral_m": actual_lateral,
+        "expected_lateral_m": expected_lateral_m,
+        "lateral_error_m": actual_lateral - expected_lateral_m,
+        "actual_velocity_mps": actual_velocity,
+        "expected_velocity_mps": expected_velocity_mps,
+        "velocity_error_mps": actual_velocity - expected_velocity_mps,
+        "actual_angle_deg": actual_angle,
+        "expected_angle_deg": expected_angle,
+        "angle_error_deg": actual_angle - expected_angle,
+    }
+
+
+def _match_object_for_point_item(
+    item: Mapping[str, Any],
+    range_tolerance: float = 4.0,
+    velocity_tolerance: float = 3.0,
+) -> Any | None:
+    frame = item.get("frame")
+    point = item.get("point")
+    if frame is None or point is None:
+        return None
+    candidates = []
+    for obj in frame.get("objects", []):
+        range_error = abs(float(obj.dist_long) - float(point.range_m))
+        velocity_error = abs(float(obj.vre_long) - float(point.velocity))
+        if range_error > range_tolerance or velocity_error > velocity_tolerance:
+            continue
+        candidates.append((range_error, velocity_error, obj))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
+def _sample_from_object_item(
+    item: Mapping[str, Any],
+    expected_longitudinal_m: float,
+    expected_lateral_m: float,
+    expected_velocity_mps: float,
+    *,
+    cycle_index: int | None = None,
+    target_index: int | None = None,
+) -> dict[str, Any] | None:
+    obj = item.get("object")
+    if obj is None:
+        return None
+    actual_longitudinal = float(obj.dist_long)
+    actual_lateral = float(obj.dist_lat)
+    actual_velocity = float(obj.vre_long)
+    actual_angle = _object_angle_deg(obj)
+    expected_angle = math.degrees(math.atan2(expected_lateral_m, expected_longitudinal_m)) if expected_longitudinal_m else 0.0
+    return {
+        "frame_idx": item.get("frame_idx"),
+        "cycle_index": cycle_index,
+        "target_index": target_index,
+        "source": "object",
+        "actual_longitudinal_m": actual_longitudinal,
+        "expected_longitudinal_m": expected_longitudinal_m,
+        "longitudinal_error_m": actual_longitudinal - expected_longitudinal_m,
+        "actual_lateral_m": actual_lateral,
+        "expected_lateral_m": expected_lateral_m,
+        "lateral_error_m": actual_lateral - expected_lateral_m,
+        "actual_velocity_mps": actual_velocity,
+        "expected_velocity_mps": expected_velocity_mps,
+        "velocity_error_mps": actual_velocity - expected_velocity_mps,
+        "actual_angle_deg": actual_angle,
+        "expected_angle_deg": expected_angle,
+        "angle_error_deg": actual_angle - expected_angle,
+    }
+
+
+def evaluate_dynamic_distance_errors(
+    tracks: list[Mapping[str, Any]],
+    scenario: Mapping[str, Any],
+    *,
+    angle_unit: str = "deg",
+) -> dict[str, Any]:
+    longitudinal_tolerance = scenario_longitudinal_tolerance(scenario)
+    lateral_tolerance = scenario_lateral_tolerance(scenario)
+    velocity_tolerance = scenario_velocity_tolerance(scenario)
+    samples: list[Mapping[str, Any]] = []
+    configured_angle = float(scenario.get("angle", 0.0))
+    target_speed = float(scenario["speed"])
+
+    for cycle_index, track in enumerate(tracks, 1):
+        items = track.get("items", [])
+        if not items:
+            continue
+        first_frame = items[0].get("frame_idx")
+        if first_frame is None:
+            continue
+        anchor_range = float(track.get("start_range_m", items[0]["point"].range_m))
+        for item in items:
+            frame_idx = item.get("frame_idx")
+            if frame_idx is None:
+                continue
+            expected_longitudinal = anchor_range + target_speed * 0.1 * (frame_idx - first_frame)
+            expected_lateral = _expected_lateral_from_angle(
+                expected_longitudinal,
+                configured_angle,
+                angle_unit=angle_unit,
+            )
+            sample = _sample_from_point_item(
+                item,
+                expected_longitudinal,
+                expected_lateral,
+                target_speed,
+                cycle_index=cycle_index,
+                angle_unit=angle_unit,
+            )
+            if sample is not None:
+                samples.append(sample)
+
+    summary = summarize_distance_error_samples(
+        samples,
+        longitudinal_tolerance,
+        lateral_tolerance,
+        velocity_tolerance,
+    )
+    summary["expected_model"] = (
+        "dynamic: expected longitudinal distance = first matched target range + configured speed * 0.1s * frame gap; "
+        "expected lateral distance comes from configured angle, default 0m."
+    )
+    return summary
+
+
+def evaluate_fixed_distance_errors(
+    result: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+    *,
+    angle_unit: str = "deg",
+) -> dict[str, Any]:
+    longitudinal_tolerance = scenario_longitudinal_tolerance(scenario)
+    lateral_tolerance = scenario_lateral_tolerance(scenario)
+    velocity_tolerance = scenario_velocity_tolerance(scenario)
+    expected_longitudinal = float(scenario["range"])
+    configured_angle = float(scenario.get("angle", 0.0))
+    expected_velocity = float(scenario["speed"])
+    expected_lateral = _expected_lateral_from_angle(
+        expected_longitudinal,
+        configured_angle,
+        angle_unit=angle_unit,
+    )
+    samples = []
+    for item in result.get("matched_items", result.get("items", [])):
+        sample = _sample_from_point_item(
+            item,
+            expected_longitudinal,
+            expected_lateral,
+            expected_velocity,
+            target_index=1,
+            angle_unit=angle_unit,
+        )
+        if sample is not None:
+            samples.append(sample)
+    summary = summarize_distance_error_samples(
+        samples,
+        longitudinal_tolerance,
+        lateral_tolerance,
+        velocity_tolerance,
+    )
+    summary["expected_model"] = (
+        "fixed: expected longitudinal distance = configured target range; "
+        "expected lateral distance comes from configured angle, default 0m."
+    )
+    return summary
+
+
+def evaluate_speed_sweep_distance_errors(
+    result: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+    *,
+    angle_unit: str = "deg",
+) -> dict[str, Any]:
+    longitudinal_tolerance = scenario_longitudinal_tolerance(scenario)
+    lateral_tolerance = scenario_lateral_tolerance(scenario)
+    velocity_tolerance = scenario_velocity_tolerance(scenario)
+    expected_longitudinal = float(scenario["range"])
+    configured_angle = float(scenario.get("angle", 0.0))
+    expected_lateral = _expected_lateral_from_angle(
+        expected_longitudinal,
+        configured_angle,
+        angle_unit=angle_unit,
+    )
+    samples = []
+    for item in result.get("matched_items", []):
+        expected_velocity = float(item.get("point").velocity) if item.get("point") is not None else 0.0
+        sample = _sample_from_point_item(
+            item,
+            expected_longitudinal,
+            expected_lateral,
+            expected_velocity,
+            target_index=1,
+            angle_unit=angle_unit,
+        )
+        if sample is not None:
+            samples.append(sample)
+    summary = summarize_distance_error_samples(
+        samples,
+        longitudinal_tolerance,
+        lateral_tolerance,
+        velocity_tolerance,
+    )
+    summary["expected_model"] = (
+        "speed sweep: expected longitudinal distance = configured sweep range; "
+        "expected lateral distance comes from configured angle, default 0m."
+    )
+    return summary
+
+
+def evaluate_multi_distance_errors(
+    result: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+) -> dict[str, Any]:
+    longitudinal_tolerance = scenario_longitudinal_tolerance(scenario)
+    lateral_tolerance = scenario_lateral_tolerance(scenario)
+    velocity_tolerance = scenario_velocity_tolerance(scenario)
+    targets = list(scenario.get("targets", []))
+    samples = []
+    for item in result.get("resolved_target_items", []):
+        target_index = int(item.get("target_index", 1))
+        target = targets[target_index - 1] if 0 <= target_index - 1 < len(targets) else {}
+        expected_longitudinal = float(item.get("expected_range", target.get("range", 0.0)))
+        expected_velocity = float(item.get("expected_speed", target.get("speed", 0.0)))
+        expected_lateral = float(target.get("lateral", 0.0))
+        if "angle" in target:
+            expected_lateral = _expected_lateral_from_angle(
+                expected_longitudinal,
+                float(target["angle"]),
+                angle_unit="deg",
+            )
+        sample = _sample_from_object_item(
+            item,
+            expected_longitudinal,
+            expected_lateral,
+            expected_velocity,
+            target_index=target_index,
+        )
+        if sample is not None:
+            samples.append(sample)
+    summary = summarize_distance_error_samples(
+        samples,
+        longitudinal_tolerance,
+        lateral_tolerance,
+        velocity_tolerance,
+    )
+    summary["expected_model"] = (
+        "multi-target: expected longitudinal distance = configured target range for each matched object; "
+        "expected lateral distance comes from configured target angle/lateral offset, default 0m."
+    )
+    return summary
+
+
 def summarize_matched_frame_continuity(
     matched_frames: list[int],
     frame_span: tuple[int | None, int | None] | None = None,
@@ -304,6 +786,166 @@ def append_point_continuity_summary(
             f"missing_sample={missing_sample}, "
             f"continuous={'PASS' if cycle.get('continuous_pass') else 'FAIL'}, "
             f"no_3_frame_loss={'PASS' if cycle.get('no_three_frame_loss_pass') else 'FAIL'}"
+        )
+    return insert_lines_before_overall(report, extra_lines)
+
+
+def append_distance_error_summary(report: str, result: Mapping[str, Any]) -> str:
+    sample_count = result.get("sample_count", 0)
+    long_tolerance = result.get("longitudinal_tolerance_m")
+    lateral_tolerance = result.get("lateral_tolerance_m")
+    velocity_tolerance = result.get("velocity_tolerance_mps")
+    max_longitudinal_sample = result.get("max_longitudinal_error_sample") or {}
+    max_lateral_sample = result.get("max_lateral_error_sample") or {}
+    max_velocity_sample = result.get("max_velocity_error_sample") or {}
+    max_angle_sample = result.get("max_angle_error_sample") or {}
+    extra_lines = [
+        f"纵向距离误差检查 | Longitudinal distance error check (+/-{long_tolerance}m): "
+        f"samples={sample_count}, "
+        f"max_abs_error={result.get('max_abs_longitudinal_error_m')}m, "
+        f"avg_abs_error={result.get('avg_abs_longitudinal_error_m')}m, "
+        f"error_range={result.get('min_longitudinal_error_m')}~{result.get('max_longitudinal_error_m')}m "
+        f"-> {'PASS' if result.get('longitudinal_pass') else 'FAIL'}"
+    ]
+    if max_longitudinal_sample:
+        cycle_text = (
+            f", cycle={max_longitudinal_sample['cycle_index']}"
+            if max_longitudinal_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_longitudinal_sample['target_index']}"
+            if max_longitudinal_sample.get("target_index") is not None
+            else ""
+        )
+        longitudinal_error = float(max_longitudinal_sample.get("longitudinal_error_m", 0.0))
+        extra_lines.append(
+            "最大纵向误差位置 | Max longitudinal error detail: "
+            f"frame={max_longitudinal_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_longitudinal_sample.get('source')}, "
+            f"actual={max_longitudinal_sample.get('actual_longitudinal_m')}m, "
+            f"expected={max_longitudinal_sample.get('expected_longitudinal_m')}m, "
+            f"calculation={max_longitudinal_sample.get('actual_longitudinal_m')} - "
+            f"{max_longitudinal_sample.get('expected_longitudinal_m')} = "
+            f"{max_longitudinal_sample.get('longitudinal_error_m')}m, "
+            f"abs_error={abs(longitudinal_error):.3f}m"
+        )
+    if lateral_tolerance is None:
+        extra_lines.append(
+            "横向距离误差记录 | Lateral distance error record: "
+            f"samples={sample_count}, "
+            f"max_abs_error={result.get('max_abs_lateral_error_m')}m, "
+            f"avg_abs_error={result.get('avg_abs_lateral_error_m')}m, "
+            f"error_range={result.get('min_lateral_error_m')}~{result.get('max_lateral_error_m')}m, "
+            "tolerance=not configured -> RECORDED"
+        )
+    else:
+        extra_lines.append(
+            f"横向距离误差检查 | Lateral distance error check (+/-{lateral_tolerance}m): "
+            f"samples={sample_count}, "
+            f"max_abs_error={result.get('max_abs_lateral_error_m')}m, "
+            f"avg_abs_error={result.get('avg_abs_lateral_error_m')}m, "
+            f"error_range={result.get('min_lateral_error_m')}~{result.get('max_lateral_error_m')}m "
+            f"-> {'PASS' if result.get('lateral_pass') else 'FAIL'}"
+        )
+    if max_lateral_sample:
+        cycle_text = (
+            f", cycle={max_lateral_sample['cycle_index']}"
+            if max_lateral_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_lateral_sample['target_index']}"
+            if max_lateral_sample.get("target_index") is not None
+            else ""
+        )
+        lateral_error = float(max_lateral_sample.get("lateral_error_m", 0.0))
+        extra_lines.append(
+            "最大横向误差位置 | Max lateral error detail: "
+            f"frame={max_lateral_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_lateral_sample.get('source')}, "
+            f"actual={max_lateral_sample.get('actual_lateral_m')}m, "
+            f"expected={max_lateral_sample.get('expected_lateral_m')}m, "
+            f"calculation={max_lateral_sample.get('actual_lateral_m')} - "
+            f"{max_lateral_sample.get('expected_lateral_m')} = "
+            f"{max_lateral_sample.get('lateral_error_m')}m, "
+            f"abs_error={abs(lateral_error):.3f}m"
+        )
+    extra_lines.append(
+        f"速度误差检查 | Velocity error check (+/-{velocity_tolerance}m/s): "
+        f"samples={sample_count}, "
+        f"max_abs_error={result.get('max_abs_velocity_error_mps')}m/s, "
+        f"avg_abs_error={result.get('avg_abs_velocity_error_mps')}m/s, "
+        f"error_range={result.get('min_velocity_error_mps')}~{result.get('max_velocity_error_mps')}m/s "
+        f"-> {'PASS' if result.get('velocity_pass') else 'FAIL'}"
+    )
+    if max_velocity_sample:
+        cycle_text = (
+            f", cycle={max_velocity_sample['cycle_index']}"
+            if max_velocity_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_velocity_sample['target_index']}"
+            if max_velocity_sample.get("target_index") is not None
+            else ""
+        )
+        velocity_error = float(max_velocity_sample.get("velocity_error_mps", 0.0))
+        extra_lines.append(
+            "最大速度误差位置 | Max velocity error detail: "
+            f"frame={max_velocity_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_velocity_sample.get('source')}, "
+            f"actual={max_velocity_sample.get('actual_velocity_mps')}m/s, "
+            f"expected={max_velocity_sample.get('expected_velocity_mps')}m/s, "
+            f"calculation={max_velocity_sample.get('actual_velocity_mps')} - "
+            f"{max_velocity_sample.get('expected_velocity_mps')} = "
+            f"{max_velocity_sample.get('velocity_error_mps')}m/s, "
+            f"abs_error={abs(velocity_error):.3f}m/s"
+        )
+    extra_lines.append(
+        "角度偏差估计 | Angle bias estimate: "
+        f"samples={sample_count}, "
+        f"avg_bias={result.get('avg_angle_bias_deg')}deg, "
+        f"max_abs_error={result.get('max_abs_angle_error_deg')}deg, "
+        f"avg_abs_error={result.get('avg_abs_angle_error_deg')}deg, "
+        f"error_range={result.get('min_angle_error_deg')}~{result.get('max_angle_error_deg')}deg"
+    )
+    if max_angle_sample:
+        cycle_text = (
+            f", cycle={max_angle_sample['cycle_index']}"
+            if max_angle_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_angle_sample['target_index']}"
+            if max_angle_sample.get("target_index") is not None
+            else ""
+        )
+        angle_error = float(max_angle_sample.get("angle_error_deg", 0.0))
+        extra_lines.append(
+            "最大角度偏差位置 | Max angle bias detail: "
+            f"frame={max_angle_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_angle_sample.get('source')}, "
+            f"actual={max_angle_sample.get('actual_angle_deg')}deg, "
+            f"expected={max_angle_sample.get('expected_angle_deg')}deg, "
+            f"calculation={max_angle_sample.get('actual_angle_deg')} - "
+            f"{max_angle_sample.get('expected_angle_deg')} = "
+            f"{max_angle_sample.get('angle_error_deg')}deg, "
+            f"abs_error={abs(angle_error):.3f}deg"
+        )
+    if result.get("expected_model"):
+        extra_lines.append(f"距离误差判定逻辑 | Distance error model: {result['expected_model']}")
+    for detail in result.get("details", [])[:5]:
+        cycle_text = f", cycle={detail['cycle_index']}" if detail.get("cycle_index") is not None else ""
+        target_text = f", target={detail['target_index']}" if detail.get("target_index") is not None else ""
+        extra_lines.append(
+            "距离误差样例 | Distance error sample: "
+            f"frame={detail.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={detail.get('source')}, "
+            f"longitudinal actual/expected/error="
+            f"{detail.get('actual_longitudinal_m')}/{detail.get('expected_longitudinal_m')}/{detail.get('longitudinal_error_m')}m, "
+            f"lateral actual/expected/error="
+            f"{detail.get('actual_lateral_m')}/{detail.get('expected_lateral_m')}/{detail.get('lateral_error_m')}m"
         )
     return insert_lines_before_overall(report, extra_lines)
 
@@ -634,10 +1276,20 @@ def append_dynamic_track_build_summary(report: str, result: Mapping[str, Any]) -
 def insert_lines_before_overall(report: str, extra_lines: list[str]) -> str:
     lines = report.rstrip("\n").splitlines()
     for idx, line in enumerate(lines):
-        if line.startswith("最终结论 | Overall result:"):
+        if "Overall result:" in line:
             lines[idx:idx] = extra_lines
             return "\n".join(lines) + "\n"
     return "\n".join(lines + extra_lines) + "\n"
+
+
+def replace_overall_result(report: str, overall_pass: bool) -> str:
+    lines = report.rstrip("\n").splitlines()
+    for idx, line in enumerate(lines):
+        if "Overall result:" in line:
+            prefix = line.split("Overall result:", 1)[0]
+            lines[idx] = f"{prefix}Overall result: {'PASS' if overall_pass else 'FAIL'}"
+            return "\n".join(lines) + "\n"
+    return report.rstrip("\n") + f"\nOverall result: {'PASS' if overall_pass else 'FAIL'}\n"
 
 
 def append_approaching_complete_cycle_summary(report: str, result: Mapping[str, Any]) -> str:
@@ -858,7 +1510,10 @@ def build_fixed_recording_report(
     criteria_2 = {
         "range": "判定条件2 | Criteria 2: 读取距离与模拟器设置距离误差在 +/-0.4m 内 | measured range error is within +/-0.4m of configured simulator range",
         "speed": "判定条件2 | Criteria 2: 读取速度与模拟器设置速度误差在 +/-0.1m/s 内 | measured speed error is within +/-0.1m/s of configured simulator speed",
-    }[validation_mode]
+    }.get(
+        validation_mode,
+        "Criteria 2: measured horizontal angle error is within configured simulator angle tolerance",
+    )
     lines = [
         "=" * 60,
         "静态目标验证 | Fixed Target Validation",
@@ -917,7 +1572,13 @@ def build_fixed_recording_report(
             f"最长连续丢帧区间 | Longest consecutive missing run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
-    if validation_mode == "range":
+    if validation_mode == "angle":
+        lines.append(
+            f"角度容差检查 | Angle tolerance check (+/-{result['angle_error_tolerance_deg']}deg): "
+            f"max abs error = {result['max_abs_angle_error_deg']}deg "
+            f"-> {'PASS' if result['angle_pass'] else 'FAIL'}"
+        )
+    elif validation_mode == "range":
         lines.append(
             f"距离容差检查 | Range tolerance check (+/-{result['range_error_tolerance_m']}m): "
             f"max abs error = {result['max_abs_range_error_m']}m "
@@ -1246,6 +1907,10 @@ def analyze_receding_recording(
         frame_limit=dynamic_track_build_frame_limit(scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
+    distance_error_result = evaluate_dynamic_distance_errors(tracks, scenario)
+    result["overall_pass"] = result["overall_pass"] and distance_error_result["longitudinal_pass"] and distance_error_result["velocity_pass"]
+    if distance_error_result["lateral_pass"] is not None:
+        result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
 
     print()
     report = build_receding_recording_report(
@@ -1260,6 +1925,8 @@ def analyze_receding_recording(
     report = append_receding_result_summary(report, result)
     report = append_dynamic_track_build_summary(report, track_build_result)
     report = append_point_continuity_summary(report, continuity_result)
+    report = append_distance_error_summary(report, distance_error_result)
+    report = replace_overall_result(report, result["overall_pass"])
     print(report, end="")
     log_path = write_receding_recording_log(frame_path, profile, selection, report)
     print(f"[INFO] Saved max-distance log: {log_path}")
@@ -1294,6 +1961,7 @@ def analyze_approaching_recording(
         frame_limit=dynamic_track_build_frame_limit(scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
+    distance_error_result = evaluate_dynamic_distance_errors(tracks, scenario)
 
     print()
     report = build_approaching_recording_report(
@@ -1309,6 +1977,19 @@ def analyze_approaching_recording(
     report = append_approaching_complete_cycle_summary(report, track_build_result)
     report = append_dynamic_track_build_summary(report, track_build_result)
     report = append_point_continuity_summary(report, continuity_result)
+    report = append_distance_error_summary(report, distance_error_result)
+    approaching_overall_pass = (
+        bool(tracks)
+        and point_count_summary["point_count_pass"]
+        and track_build_result["track_build_pass"]
+        and continuity_result["continuous_pass"]
+        and continuity_result["no_three_frame_loss_pass"]
+        and distance_error_result["longitudinal_pass"]
+        and distance_error_result["velocity_pass"]
+    )
+    if distance_error_result["lateral_pass"] is not None:
+        approaching_overall_pass = approaching_overall_pass and distance_error_result["lateral_pass"]
+    report = replace_overall_result(report, approaching_overall_pass)
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
@@ -1379,7 +2060,19 @@ def analyze_fixed_recording(
     point_count_result = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events(frames)
     result.update(point_count_result)
-    result["overall_pass"] = result["overall_pass"] and result["point_count_pass"]
+    distance_error_result = evaluate_fixed_distance_errors(
+        result,
+        scenario,
+        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+    )
+    result["overall_pass"] = (
+        result["overall_pass"]
+        and result["point_count_pass"]
+        and distance_error_result["longitudinal_pass"]
+        and distance_error_result["velocity_pass"]
+    )
+    if distance_error_result["lateral_pass"] is not None:
+        result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
     continuity_result = build_single_point_continuity_result(
         list(result.get("matched_frames", [])),
         first_frame=result.get("first_frame"),
@@ -1398,6 +2091,8 @@ def analyze_fixed_recording(
     )
     report = append_fixed_tolerance_note(report, scenario, validation_mode)
     report = append_point_continuity_summary(report, continuity_result, label="target")
+    report = append_distance_error_summary(report, distance_error_result)
+    report = replace_overall_result(report, result["overall_pass"])
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
@@ -1467,7 +2162,16 @@ def analyze_m1_resolution(
     resolution_threshold_m = float(scenario.get("resolution_threshold_m", 0.85))
     result["resolution_threshold_m"] = resolution_threshold_m
     result["resolution_pass"] = result["resolution_before_merge_m"] < resolution_threshold_m
-    result["overall_pass"] = result["continuity_pass"] and result["resolution_pass"] and result["point_count_pass"]
+    distance_error_result = evaluate_multi_distance_errors(result, scenario)
+    result["overall_pass"] = (
+        result["continuity_pass"]
+        and result["resolution_pass"]
+        and result["point_count_pass"]
+        and distance_error_result["longitudinal_pass"]
+        and distance_error_result["velocity_pass"]
+    )
+    if distance_error_result["lateral_pass"] is not None:
+        result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
     continuity_result = build_single_point_continuity_result(
         list(result.get("resolved_frames", [])),
         first_frame=(min(result["resolved_frames"]) if result.get("resolved_frames") else None),
@@ -1476,6 +2180,8 @@ def analyze_m1_resolution(
 
     report = build_multi_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
     report = append_point_continuity_summary(report, continuity_result, label="target")
+    report = append_distance_error_summary(report, distance_error_result)
+    report = replace_overall_result(report, result["overall_pass"])
     print()
     print(report, end="")
     log_path = write_receding_recording_log(
@@ -1546,7 +2252,16 @@ def analyze_m2_speed_resolution(
     speed_resolution_threshold_mps = float(scenario.get("speed_resolution_threshold_mps", 0.2))
     result["speed_resolution_threshold_mps"] = speed_resolution_threshold_mps
     result["resolution_pass"] = result["resolution_before_merge_mps"] < speed_resolution_threshold_mps
-    result["overall_pass"] = result["continuity_pass"] and result["resolution_pass"] and result["point_count_pass"]
+    distance_error_result = evaluate_multi_distance_errors(result, scenario)
+    result["overall_pass"] = (
+        result["continuity_pass"]
+        and result["resolution_pass"]
+        and result["point_count_pass"]
+        and distance_error_result["longitudinal_pass"]
+        and distance_error_result["velocity_pass"]
+    )
+    if distance_error_result["lateral_pass"] is not None:
+        result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
     continuity_result = build_single_point_continuity_result(
         list(result.get("resolved_frames", [])),
         first_frame=(min(result["resolved_frames"]) if result.get("resolved_frames") else None),
@@ -1555,6 +2270,8 @@ def analyze_m2_speed_resolution(
 
     report = build_multi_speed_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
     report = append_point_continuity_summary(report, continuity_result, label="target")
+    report = append_distance_error_summary(report, distance_error_result)
+    report = replace_overall_result(report, result["overall_pass"])
     print()
     print(report, end="")
     log_path = write_receding_recording_log(
@@ -1587,7 +2304,15 @@ def analyze_speed_sweep_recording(
     )
     result.update(analyze_expected_point_count(frames, expected_point_count=2))
     alarm_summary = summarize_alarm_events(frames)
-    result["overall_pass"] = result["speed_range_pass"] and result["point_count_pass"]
+    distance_error_result = evaluate_speed_sweep_distance_errors(result, scenario)
+    result["overall_pass"] = (
+        result["speed_range_pass"]
+        and result["point_count_pass"]
+        and distance_error_result["longitudinal_pass"]
+        and distance_error_result["velocity_pass"]
+    )
+    if distance_error_result["lateral_pass"] is not None:
+        result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
     track_build_result = build_speed_sweep_track_build_result(
         result,
         frame_limit=dynamic_track_build_frame_limit(scenario),
@@ -1602,6 +2327,8 @@ def analyze_speed_sweep_recording(
     report = build_speed_sweep_report(frame_path, profile, selection, scenario, result, alarm_summary)
     report = append_dynamic_track_build_summary(report, track_build_result)
     report = append_point_continuity_summary(report, continuity_result, label="target")
+    report = append_distance_error_summary(report, distance_error_result)
+    report = replace_overall_result(report, result["overall_pass"])
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
