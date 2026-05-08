@@ -144,11 +144,15 @@ class RadarTargetSimulator(AbstractContextManager["RadarTargetSimulator"]):
 
     def run_fixed(self, target_id: int) -> None:
         target = self._get_scenario(self.profile.fixed_targets, target_id, "fixed target")
+        angle = target.get("angle")
+        if angle is not None and not isinstance(angle, (int, float)):
+            raise ValueError("fixed target angle must be numeric")
         self._set_object(
             1,
             speed=self._require_number(target, "speed"),
             range_m=self._require_number(target, "range"),
             rcs=self._require_number(target, "rcs"),
+            angle=angle,
         )
 
     def run_multi(self, multi_id: int) -> None:

@@ -17,6 +17,12 @@ from radar_simulator import DEFAULT_IP, RadarTargetSimulator
 
 
 Selection = tuple[str, int]
+DEFAULT_TRACK_BUILD_FRAME_LIMIT = 3
+LATERAL_STABILITY_CRITERIA = (
+    "if min_angle < -0.15deg and max_angle > 0.15deg -> left-right crossing; "
+    "else if angle_span > 0.3deg or angle_std > 0.12deg -> noticeable jitter; "
+    "otherwise -> stable."
+)
 
 
 def choose_profile(default: str | None = None) -> BrandProfile:
@@ -97,10 +103,13 @@ def _parse_prefixed_selection(
 
 def choose_scenario(profile: BrandProfile) -> Selection | None:
     show_menu(profile)
-    prompt = (
-        f"Choose scenario ({profile.dynamic_ids}, {profile.fixed_ids}, "
-        f"{profile.multi_ids}, Q=quit): "
-    )
+    prompt_parts = [profile.dynamic_ids] if profile.dynamic_ids else []
+    if profile.fixed_ids:
+        prompt_parts.append(profile.fixed_ids)
+    if profile.multi_ids:
+        prompt_parts.append(profile.multi_ids)
+    prompt_parts.append("Q=quit")
+    prompt = f"Choose scenario ({', '.join(prompt_parts)}): "
     while True:
         try:
             return parse_selection(input(prompt), profile)
@@ -109,6 +118,10 @@ def choose_scenario(profile: BrandProfile) -> Selection | None:
 
 
 def start_simulation(sim: RadarTargetSimulator, selection: Selection) -> threading.Thread | None:
+    return begin_simulation(sim, selection)
+
+
+def begin_simulation(sim: RadarTargetSimulator, selection: Selection) -> threading.Thread | None:
     kind, scenario_id = selection
     profile = sim.profile
 
@@ -176,6 +189,123 @@ def dynamic_cycle_seconds(scenario: Mapping[str, Any], margin_seconds: float = 2
     r_start = scenario["r_start"]
     r_end = scenario["r_end"]
     return abs(float(r_end) - float(r_start)) / abs(float(speed)) + margin_seconds
+
+
+def dynamic_track_build_frame_limit(scenario: Mapping[str, Any]) -> int:
+    return int(scenario.get("track_build_frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT))
+
+
+def summarize_matched_frame_continuity(
+    matched_frames: list[int],
+    frame_span: tuple[int | None, int | None] | None = None,
+) -> dict[str, Any]:
+    matched_frames = sorted(set(frame for frame in matched_frames if frame is not None))
+    if not matched_frames:
+        return {
+            "target_found": False,
+            "first_frame": None,
+            "last_frame": None,
+            "matched_frame_count": 0,
+            "missing_frames": [],
+            "max_consecutive_missing": None,
+            "longest_missing_run": None,
+            "continuous_pass": False,
+            "no_three_frame_loss_pass": False,
+        }
+
+    first_frame = frame_span[0] if frame_span and frame_span[0] is not None else matched_frames[0]
+    last_frame = frame_span[1] if frame_span and frame_span[1] is not None else matched_frames[-1]
+    matched_set = set(matched_frames)
+    missing_frames = [frame for frame in range(first_frame, last_frame + 1) if frame not in matched_set]
+    max_run = 0
+    current_run = 0
+    current_start = None
+    longest_run = None
+    for frame in range(first_frame, last_frame + 1):
+        if frame in matched_set:
+            current_run = 0
+            current_start = None
+            continue
+        if current_run == 0:
+            current_start = frame
+        current_run += 1
+        if current_run > max_run:
+            max_run = current_run
+            longest_run = (current_start, frame, current_run)
+
+    return {
+        "target_found": True,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "matched_frame_count": len(matched_frames),
+        "missing_frames": missing_frames,
+        "max_consecutive_missing": max_run,
+        "longest_missing_run": longest_run,
+        "continuous_pass": not missing_frames,
+        "no_three_frame_loss_pass": max_run < 3,
+    }
+
+
+def evaluate_dynamic_point_continuity(tracks: list[Mapping[str, Any]]) -> dict[str, Any]:
+    cycle_results = []
+    for idx, track in enumerate(tracks, 1):
+        summary = summarize_matched_frame_continuity(
+            list(track.get("matched_frames", [])),
+            frame_span=(track.get("first_frame"), track.get("last_frame")),
+        )
+        cycle_results.append({"cycle_index": idx, **summary})
+
+    return {
+        "cycle_results": cycle_results,
+        "continuous_pass": bool(cycle_results) and all(result["continuous_pass"] for result in cycle_results),
+        "no_three_frame_loss_pass": bool(cycle_results) and all(result["no_three_frame_loss_pass"] for result in cycle_results),
+    }
+
+
+def build_single_point_continuity_result(
+    matched_frames: list[int],
+    first_frame: int | None = None,
+    last_frame: int | None = None,
+) -> dict[str, Any]:
+    summary = summarize_matched_frame_continuity(
+        matched_frames,
+        frame_span=(first_frame, last_frame),
+    )
+    return {
+        "cycle_results": [{"cycle_index": 1, **summary}],
+        "continuous_pass": summary["continuous_pass"],
+        "no_three_frame_loss_pass": summary["no_three_frame_loss_pass"],
+    }
+
+
+def append_point_continuity_summary(
+    report: str,
+    result: Mapping[str, Any],
+    label: str = "cycle",
+) -> str:
+    extra_lines = [
+        f"点云连续性总结果 | Point-cloud continuity overall: target point appears continuously with no interruption "
+        f"-> {'PASS' if result.get('continuous_pass') else 'FAIL'}",
+        f"连续3帧丢失检查总结果 | 3-frame loss overall: no internal 3 consecutive missed frames after target appears "
+        f"-> {'PASS' if result.get('no_three_frame_loss_pass') else 'FAIL'}",
+    ]
+    cycle_results = result.get("cycle_results", [])
+    if not cycle_results:
+        extra_lines.append("点云连续性明细 | Point-cloud continuity details: no matched target point.")
+    for cycle in cycle_results:
+        missing_frames = cycle.get("missing_frames", [])
+        missing_sample = ", ".join(str(frame) for frame in missing_frames[:10]) if missing_frames else "none"
+        extra_lines.append(
+            f"点云连续性明细 | Point-cloud continuity {label} #{cycle['cycle_index']}: "
+            f"frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"matched_frames={cycle.get('matched_frame_count')}, "
+            f"missing_frames={len(missing_frames)}, "
+            f"max_consecutive_missing={cycle.get('max_consecutive_missing')}, "
+            f"missing_sample={missing_sample}, "
+            f"continuous={'PASS' if cycle.get('continuous_pass') else 'FAIL'}, "
+            f"no_3_frame_loss={'PASS' if cycle.get('no_three_frame_loss_pass') else 'FAIL'}"
+        )
+    return insert_lines_before_overall(report, extra_lines)
 
 
 def auto_record_seconds(selection: Selection, profile: BrandProfile, default_seconds: int) -> int:
@@ -257,6 +387,7 @@ def build_receding_recording_report(
     alarm_summary: Mapping[str, Any],
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
         "目标远离丢失分析 | Receding Target Loss Analysis",
@@ -268,6 +399,7 @@ def build_receding_recording_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         "判定条件 | Criteria: 远离动态目标，连续3帧未检出判定为丢失 | receding dynamic target, loss = 3 consecutive missed frames",
+        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
 
@@ -318,6 +450,7 @@ def build_receding_recording_report(
         )
     else:
         lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都存在明显横向漂移或抖动 | all detected cycles show noticeable lateral drift or jitter.")
+    lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
         f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
         f"observed_min={point_count_summary['observed_min_point_count']}, observed_max={point_count_summary['observed_max_point_count']} "
@@ -332,7 +465,8 @@ def build_receding_recording_report(
     lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"报警区间 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
+            f"source={event.get('alarm_source', 'alarm_type')}, type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"object_distlong_start={event['earliest_distance_m']}m, "
             f"object_distlong_farthest={event['farthest_distance_m']}m, "
@@ -340,6 +474,277 @@ def build_receding_recording_report(
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
     return "\n".join(lines) + "\n"
+
+
+def evaluate_receding_recording(
+    scenario: Mapping[str, Any],
+    tracks: list[Mapping[str, Any]],
+    point_count_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    from detect_loss import summarize_track_object_ids
+
+    record_loss_distance_only = bool(scenario.get("record_loss_distance_only", False))
+    farthest_detected_range = max((track["max_range_m"] for track in tracks), default=None)
+    min_max_detected_range = scenario.get("min_max_detected_range")
+    max_detected_range_strict = bool(scenario.get("min_max_detected_range_strict", True))
+    primary_track = max(tracks, key=lambda track: (track["detections"], track["duration_frames"])) if tracks else None
+    track_build_frame_limit = scenario.get("track_build_frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT)
+    require_lateral_stable = bool(scenario.get("require_lateral_stable", False))
+    require_continuous_track = bool(scenario.get("require_continuous_track", False))
+
+    max_detected_range_pass = None
+    if not record_loss_distance_only and isinstance(min_max_detected_range, (int, float)):
+        if farthest_detected_range is None:
+            max_detected_range_pass = False
+        elif max_detected_range_strict:
+            max_detected_range_pass = farthest_detected_range > float(min_max_detected_range)
+        else:
+            max_detected_range_pass = farthest_detected_range >= float(min_max_detected_range)
+
+    checks = [bool(tracks), point_count_summary["point_count_pass"]]
+    continuous_track_pass = None
+    object_id_summary = summarize_track_object_ids(primary_track) if primary_track else None
+    if require_continuous_track:
+        continuous_track_pass = (
+            bool(primary_track)
+            and primary_track["duration_frames"] == primary_track["detections"]
+            and object_id_summary is not None
+            and bool(object_id_summary["matched_object_ids"])
+            and object_id_summary["object_id_stable"] is True
+        )
+        checks.append(continuous_track_pass)
+
+    build_frame_count = None
+    track_build_pass = None
+    if isinstance(track_build_frame_limit, (int, float)):
+        build_frame_count = None if object_id_summary is None else object_id_summary.get("object_build_frame_count")
+        track_build_pass = build_frame_count is not None and build_frame_count <= int(track_build_frame_limit)
+        checks.append(track_build_pass)
+
+    lateral_stable_pass = None
+    if require_lateral_stable:
+        lateral_stable_pass = bool(primary_track) and primary_track["lateral_status"] == "stable"
+        checks.append(lateral_stable_pass)
+
+    if max_detected_range_pass is not None:
+        checks.append(max_detected_range_pass)
+
+    return {
+        "track_found": bool(tracks),
+        "point_count_pass": point_count_summary["point_count_pass"],
+        "record_loss_distance_only": record_loss_distance_only,
+        "continuous_track_pass": continuous_track_pass,
+        "object_id_summary": object_id_summary,
+        "track_build_frame_limit": int(track_build_frame_limit) if isinstance(track_build_frame_limit, (int, float)) else None,
+        "build_frame_count": build_frame_count,
+        "track_build_pass": track_build_pass,
+        "lateral_stable_pass": lateral_stable_pass,
+        "farthest_detected_range_m": farthest_detected_range,
+        "min_max_detected_range_m": (
+            float(min_max_detected_range)
+            if not record_loss_distance_only and isinstance(min_max_detected_range, (int, float))
+            else None
+        ),
+        "max_detected_range_strict": max_detected_range_strict,
+        "max_detected_range_pass": max_detected_range_pass,
+        "overall_pass": all(checks),
+    }
+
+
+def evaluate_dynamic_track_build(
+    tracks: list[Mapping[str, Any]],
+    frame_limit: int = DEFAULT_TRACK_BUILD_FRAME_LIMIT,
+) -> dict[str, Any]:
+    from detect_loss import summarize_track_object_ids
+
+    cycle_results = []
+    complete_tracks = [track for track in tracks if track.get("loss_frame") is not None]
+    for idx, track in enumerate(tracks, 1):
+        object_summary = summarize_track_object_ids(track)
+        build_frame_count = object_summary.get("object_build_frame_count")
+        build_pass = build_frame_count is not None and build_frame_count <= frame_limit
+        cycle_results.append(
+            {
+                "cycle_index": idx,
+                "first_frame": track.get("first_frame"),
+                "last_frame": track.get("last_frame"),
+                "loss_frame": track.get("loss_frame"),
+                "complete_cycle": track.get("loss_frame") is not None,
+                "build_frame_count": build_frame_count,
+                "build_pass": build_pass,
+                "object_summary": object_summary,
+            }
+        )
+
+    completed_cycle_results = [result for result in cycle_results if result["complete_cycle"]]
+    build_farthest_distance = None
+    disappear_nearest_distance = None
+    for result in completed_cycle_results:
+        object_summary = result["object_summary"]
+        build_distance = object_summary.get("object_build_distance_m")
+        last_distance = object_summary.get("object_last_distance_m")
+        if build_distance is not None:
+            build_farthest_distance = (
+                build_distance
+                if build_farthest_distance is None
+                else max(build_farthest_distance, build_distance)
+            )
+        if last_distance is not None:
+            disappear_nearest_distance = (
+                last_distance
+                if disappear_nearest_distance is None
+                else min(disappear_nearest_distance, last_distance)
+            )
+
+    return {
+        "frame_limit": frame_limit,
+        "cycle_results": cycle_results,
+        "complete_cycle_count": len(completed_cycle_results),
+        "track_build_pass": bool(cycle_results) and all(result["build_pass"] for result in cycle_results),
+        "object_build_farthest_distance_m": build_farthest_distance,
+        "object_disappear_nearest_distance_m": disappear_nearest_distance,
+    }
+
+
+def append_dynamic_track_build_summary(report: str, result: Mapping[str, Any]) -> str:
+    extra_lines: list[str] = []
+    cycle_results = result.get("cycle_results", [])
+    frame_limit = result.get("frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT)
+    extra_lines.append(
+        f"建航时间总结果 | Track-build overall: all dynamic cycles build object within <= {frame_limit} frame(s) "
+        f"-> {'PASS' if result.get('track_build_pass') else 'FAIL'}"
+    )
+    if not cycle_results:
+        extra_lines.append("建航时间明细 | Track-build details: no matched dynamic target cycle.")
+    for cycle in cycle_results:
+        build_count = cycle.get("build_frame_count")
+        build_count_text = f"{build_count} frame(s)" if build_count is not None else "N/A"
+        object_summary = cycle.get("object_summary") or {}
+        extra_lines.append(
+            f"建航时间明细 | Track-build cycle #{cycle['cycle_index']}: "
+            f"point_first_frame={object_summary.get('first_point_frame')}, "
+            f"object_build_frame={object_summary.get('object_build_frame')}, "
+            f"build_time={build_count_text}, "
+            f"limit={frame_limit} "
+            f"-> {'PASS' if cycle.get('build_pass') else 'FAIL'}"
+        )
+    return insert_lines_before_overall(report, extra_lines)
+
+
+def insert_lines_before_overall(report: str, extra_lines: list[str]) -> str:
+    lines = report.rstrip("\n").splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith("最终结论 | Overall result:"):
+            lines[idx:idx] = extra_lines
+            return "\n".join(lines) + "\n"
+    return "\n".join(lines + extra_lines) + "\n"
+
+
+def append_approaching_complete_cycle_summary(report: str, result: Mapping[str, Any]) -> str:
+    build_distance = result.get("object_build_farthest_distance_m")
+    disappear_distance = result.get("object_disappear_nearest_distance_m")
+    complete_count = result.get("complete_cycle_count", 0)
+    build_text = f"{build_distance}m" if build_distance is not None else "N/A"
+    disappear_text = f"{disappear_distance}m" if disappear_distance is not None else "N/A"
+    extra_lines = [
+        f"完整周期目标距离汇总 | Complete-cycle object distance summary: complete_cycles={complete_count}, "
+        f"object_build_farthest_distance={build_text}, "
+        f"object_disappear_nearest_distance={disappear_text}"
+    ]
+    for cycle in result.get("cycle_results", []):
+        if not cycle.get("complete_cycle"):
+            continue
+        object_summary = cycle.get("object_summary") or {}
+        build_cycle_distance = object_summary.get("object_build_distance_m")
+        disappear_cycle_distance = object_summary.get("object_last_distance_m")
+        build_cycle_text = f"{build_cycle_distance}m" if build_cycle_distance is not None else "N/A"
+        disappear_cycle_text = f"{disappear_cycle_distance}m" if disappear_cycle_distance is not None else "N/A"
+        extra_lines.append(
+            f"完整周期目标距离明细 | Complete-cycle object distance cycle #{cycle['cycle_index']}: "
+            f"frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"loss_frame={cycle.get('loss_frame')}, "
+            f"object_build_distance={build_cycle_text}, "
+            f"object_disappear_distance={disappear_cycle_text}"
+        )
+    return report.rstrip("\n") + "\n" + "\n".join(extra_lines) + "\n"
+
+
+def append_receding_result_summary(report: str, result: Mapping[str, Any]) -> str:
+    extra_lines: list[str] = []
+    if result.get("record_loss_distance_only"):
+        return report
+    if result["continuous_track_pass"] is not None:
+        object_id_summary = result.get("object_id_summary") or {}
+        extra_lines.append(
+            "连续跟踪检查 | Continuous-track check: single matched track with stable object ID and no re-segmentation "
+            f"-> {'PASS' if result['continuous_track_pass'] else 'FAIL'}"
+        )
+        extra_lines.append(
+            f"ID跳变检查 | Object-ID stability: ids={object_id_summary.get('unique_object_ids', [])}, "
+            f"jump_count={object_id_summary.get('object_id_jump_count')} "
+            f"-> {'PASS' if object_id_summary.get('object_id_stable') else 'FAIL'}"
+        )
+    if result["track_build_pass"] is not None:
+        extra_lines.append(
+            f"建航时间检查 | Track-build check: object appears within {result['build_frame_count']} frame(s) after point-cloud target first appears, "
+            f"limit={result['track_build_frame_limit']} "
+            f"-> {'PASS' if result['track_build_pass'] else 'FAIL'}"
+        )
+    if result["lateral_stable_pass"] is not None:
+        extra_lines.append(
+            f"航迹稳定检查 | Lateral-stability check: primary track stable "
+            f"-> {'PASS' if result['lateral_stable_pass'] else 'FAIL'}"
+        )
+    if result["min_max_detected_range_m"] is not None:
+        comparator = ">" if result["max_detected_range_strict"] else ">="
+        actual = (
+            f"{result['farthest_detected_range_m']}m"
+            if result["farthest_detected_range_m"] is not None
+            else "N/A"
+        )
+        extra_lines.append(
+            f"最大距离检查 | Max-distance check: max_detected_range={actual} "
+            f"{comparator} {result['min_max_detected_range_m']}m "
+            f"-> {'PASS' if result['max_detected_range_pass'] else 'FAIL'}"
+        )
+    extra_lines.append(
+        f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}"
+    )
+    return report.rstrip("\n") + "\n" + "\n".join(extra_lines) + "\n"
+
+
+def append_fixed_tolerance_note(
+    report: str,
+    scenario: Mapping[str, Any],
+    validation_mode: str,
+) -> str:
+    if validation_mode == "range" and "range_error_tolerance" in scenario:
+        return (
+            report.rstrip("\n")
+            + "\n"
+            + f"实际阈值 | Applied tolerance: +/-{float(scenario['range_error_tolerance'])}m\n"
+        )
+    if validation_mode == "speed" and "speed_error_tolerance" in scenario:
+        return (
+            report.rstrip("\n")
+            + "\n"
+            + f"实际阈值 | Applied tolerance: +/-{float(scenario['speed_error_tolerance'])}m/s\n"
+        )
+    if validation_mode == "angle" and "angle_error_tolerance_deg" in scenario:
+        return (
+            report.rstrip("\n")
+            + "\n"
+            + f"实际阈值 | Applied tolerance: +/-{float(scenario['angle_error_tolerance_deg'])}deg\n"
+        )
+    return report
+
+
+def append_lateral_stability_note(report: str) -> str:
+    return (
+        report.rstrip("\n")
+        + "\n"
+        + f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}\n"
+    )
 
 
 def build_approaching_recording_report(
@@ -350,8 +755,10 @@ def build_approaching_recording_report(
     tracks: list[Mapping[str, Any]],
     point_count_summary: Mapping[str, Any],
     alarm_summary: Mapping[str, Any],
+    track_build_result: Mapping[str, Any] | None = None,
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
         "目标接近分析 | Approaching Target Analysis",
@@ -363,6 +770,7 @@ def build_approaching_recording_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         "判定说明 | Criteria: 接近动态目标轨迹摘要 | approaching dynamic target track summary",
+        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
 
@@ -370,7 +778,19 @@ def build_approaching_recording_report(
         lines.append("[警告/ WARN] 未找到符合条件的接近目标周期 | No approaching target cycles found.")
         return "\n".join(lines) + "\n"
 
+    build_cycles = {
+        cycle["cycle_index"]: cycle
+        for cycle in (track_build_result or {}).get("cycle_results", [])
+    }
     for idx, track in enumerate(tracks, 1):
+        build_cycle = build_cycles.get(idx, {})
+        object_summary = build_cycle.get("object_summary") or {}
+        build_frame_count = build_cycle.get("build_frame_count")
+        build_frame_text = f"{build_frame_count}" if build_frame_count is not None else "N/A"
+        build_distance = object_summary.get("object_build_distance_m")
+        last_object_distance = object_summary.get("object_last_distance_m")
+        build_distance_text = f"{build_distance}m" if build_distance is not None else "N/A"
+        last_object_distance_text = f"{last_object_distance}m" if last_object_distance is not None else "N/A"
         lines.append(
             f"  周期#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
             f"(loss_frame={track['loss_frame']}), "
@@ -378,11 +798,28 @@ def build_approaching_recording_report(
             f"start_range={track['start_range_m']}m, "
             f"closest_range={track['closest_range_m']}m, "
             f"min_range={track['min_range_m']}m, "
+            f"object_build_frame={object_summary.get('object_build_frame')}, "
+            f"object_build_time={build_frame_text} frame(s), "
+            f"object_build_distance={build_distance_text}, "
+            f"object_last_frame={object_summary.get('object_last_frame')}, "
+            f"object_last_distance={last_object_distance_text}, "
             f"avg_velocity={track['avg_velocity']}m/s, "
             f"avg_angle_az={track['avg_angle_az']}deg, "
             f"lateral_status={track['lateral_status']}"
         )
 
+    stable_tracks = [track for track in tracks if track["lateral_status"] == "stable"]
+    unstable_tracks = [track for track in tracks if track["lateral_status"] != "stable"]
+    if stable_tracks and not unstable_tracks:
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期横向稳定，无明显左右漂动 | all detected cycles are stable with no obvious left-right drift.")
+    elif stable_tracks:
+        lines.append(
+            "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
+            f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
+        )
+    else:
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都存在明显横向漂移或抖动 | all detected cycles show noticeable lateral drift or jitter.")
+    lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
         f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
         f"observed_min={point_count_summary['observed_min_point_count']}, observed_max={point_count_summary['observed_max_point_count']} "
@@ -397,7 +834,8 @@ def build_approaching_recording_report(
     lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"报警区间 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
+            f"source={event.get('alarm_source', 'alarm_type')}, type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"object_distlong_start={event['earliest_distance_m']}m, "
             f"object_distlong_farthest={event['farthest_distance_m']}m, "
@@ -515,6 +953,7 @@ def build_multi_resolution_report(
     alarm_summary: Mapping[str, Any],
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
         "多目标距离分辨力验证 | Multi-target Range Resolution Validation",
@@ -678,6 +1117,7 @@ def build_speed_sweep_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         f"判定条件 | Criteria: 测速正确范围应完整覆盖 {scenario['speed_min']}~{scenario['speed_max']}m/s | measured valid speed range should fully cover {scenario['speed_min']}~{scenario['speed_max']}m/s",
+        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
 
@@ -727,6 +1167,30 @@ def build_speed_sweep_report(
     return "\n".join(lines) + "\n"
 
 
+def build_speed_sweep_track_build_result(
+    result: Mapping[str, Any],
+    frame_limit: int = DEFAULT_TRACK_BUILD_FRAME_LIMIT,
+) -> dict[str, Any]:
+    if not result.get("matched_items"):
+        return {
+            "frame_limit": frame_limit,
+            "cycle_results": [],
+            "complete_cycle_count": 0,
+            "track_build_pass": False,
+            "object_build_farthest_distance_m": None,
+            "object_disappear_nearest_distance_m": None,
+        }
+    track = {
+        "first_frame": result["matched_items"][0]["frame_idx"],
+        "last_frame": result["matched_items"][-1]["frame_idx"],
+        "loss_frame": result["matched_items"][-1]["frame_idx"],
+        "duration_frames": result["matched_items"][-1]["frame_idx"] - result["matched_items"][0]["frame_idx"] + 1,
+        "detections": len(result["matched_items"]),
+        "items": result["matched_items"],
+    }
+    return evaluate_dynamic_track_build([track], frame_limit=frame_limit)
+
+
 def write_receding_recording_log(
     frame_path: Path,
     profile: BrandProfile,
@@ -759,7 +1223,7 @@ def analyze_receding_recording(
     selection: Selection,
     scenario: Mapping[str, Any],
 ) -> Path:
-    from detect_loss import analyze_expected_point_count, find_receding_target_tracks, parse_frames, summarize_alarm_events_for_track_objects
+    from detect_loss import analyze_expected_point_count, find_receding_target_tracks, parse_frames, summarize_alarm_events_for_tracks
 
     frames = parse_frames(frame_path)
     tracks = find_receding_target_tracks(
@@ -772,9 +1236,16 @@ def analyze_receding_recording(
         range_prediction_tolerance=4.0,
         loss_gap_frames=3,
         min_detections=8,
+        require_complete_cycle=True,
     )
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
-    alarm_summary = summarize_alarm_events_for_track_objects(tracks[0]) if tracks else {"alarm_events": [], "alarm_event_count": 0}
+    alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
+    result = evaluate_receding_recording(scenario, tracks, point_count_summary)
+    track_build_result = evaluate_dynamic_track_build(
+        tracks,
+        frame_limit=dynamic_track_build_frame_limit(scenario),
+    )
+    continuity_result = evaluate_dynamic_point_continuity(tracks)
 
     print()
     report = build_receding_recording_report(
@@ -786,6 +1257,9 @@ def analyze_receding_recording(
         point_count_summary,
         alarm_summary,
     )
+    report = append_receding_result_summary(report, result)
+    report = append_dynamic_track_build_summary(report, track_build_result)
+    report = append_point_continuity_summary(report, continuity_result)
     print(report, end="")
     log_path = write_receding_recording_log(frame_path, profile, selection, report)
     print(f"[INFO] Saved max-distance log: {log_path}")
@@ -798,7 +1272,7 @@ def analyze_approaching_recording(
     selection: Selection,
     scenario: Mapping[str, Any],
 ) -> Path:
-    from detect_loss import analyze_expected_point_count, find_approaching_target_tracks, parse_frames, summarize_alarm_events_for_track_objects
+    from detect_loss import analyze_expected_point_count, find_approaching_target_tracks, parse_frames, summarize_alarm_events_for_tracks
 
     frames = parse_frames(frame_path)
     tracks = find_approaching_target_tracks(
@@ -806,15 +1280,20 @@ def analyze_approaching_recording(
         target_speed=float(scenario["speed"]),
         velocity_tolerance=3.0,
         angle_tolerance=0.25,
-        start_range_min=max(10.0, float(scenario["r_start"]) - 5.0),
+        start_range_min=float(scenario.get("start_range_min", max(10.0, float(scenario["r_start"]) - 5.0))),
         expected_range_step=abs(float(scenario["speed"])) * 0.1,
         range_prediction_tolerance=4.0,
         loss_gap_frames=3,
         min_detections=8,
+        require_complete_cycle=True,
     )
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
-    primary_track = max(tracks, key=lambda track: (track["detections"], track["duration_frames"])) if tracks else None
-    alarm_summary = summarize_alarm_events_for_track_objects(primary_track) if primary_track else {"alarm_events": [], "alarm_event_count": 0}
+    alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
+    track_build_result = evaluate_dynamic_track_build(
+        tracks,
+        frame_limit=dynamic_track_build_frame_limit(scenario),
+    )
+    continuity_result = evaluate_dynamic_point_continuity(tracks)
 
     print()
     report = build_approaching_recording_report(
@@ -825,7 +1304,11 @@ def analyze_approaching_recording(
         tracks,
         point_count_summary,
         alarm_summary,
+        track_build_result,
     )
+    report = append_approaching_complete_cycle_summary(report, track_build_result)
+    report = append_dynamic_track_build_summary(report, track_build_result)
+    report = append_point_continuity_summary(report, continuity_result)
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
@@ -848,6 +1331,9 @@ def analyze_fixed_recording(
     from detect_loss import analyze_expected_point_count, find_fixed_target_track, parse_frames, summarize_alarm_events
 
     frames = parse_frames(frame_path)
+    range_error_tolerance = float(scenario.get("range_error_tolerance", 0.4))
+    speed_error_tolerance = float(scenario.get("speed_error_tolerance", 0.1))
+    angle_error_tolerance_deg = float(scenario.get("angle_error_tolerance_deg", 3.0))
     if validation_mode == "range":
         result = find_fixed_target_track(
             frames,
@@ -855,14 +1341,14 @@ def analyze_fixed_recording(
             target_range=float(scenario["range"]),
             target_angle=float(scenario.get("angle", 0.0)),
             matching_velocity_tolerance=2.0,
-            matching_range_tolerance=0.4,
+            matching_range_tolerance=range_error_tolerance,
             matching_angle_tolerance=None,
-            range_error_tolerance=0.4,
+            range_error_tolerance=range_error_tolerance,
             speed_error_tolerance=None,
             angle_error_tolerance_deg=None,
             angle_unit="rad" if profile.key == "xiaoniu" else "deg",
         )
-    else:
+    elif validation_mode == "speed":
         result = find_fixed_target_track(
             frames,
             target_speed=float(scenario["speed"]),
@@ -872,14 +1358,33 @@ def analyze_fixed_recording(
             matching_range_tolerance=1.0,
             matching_angle_tolerance=None,
             range_error_tolerance=None,
-            speed_error_tolerance=0.1,
+            speed_error_tolerance=speed_error_tolerance,
             angle_error_tolerance_deg=None,
+            angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+        )
+    else:
+        result = find_fixed_target_track(
+            frames,
+            target_speed=float(scenario["speed"]),
+            target_range=float(scenario["range"]),
+            target_angle=float(scenario.get("angle", 0.0)),
+            matching_velocity_tolerance=2.0,
+            matching_range_tolerance=1.0,
+            matching_angle_tolerance=None,
+            range_error_tolerance=None,
+            speed_error_tolerance=None,
+            angle_error_tolerance_deg=angle_error_tolerance_deg,
             angle_unit="rad" if profile.key == "xiaoniu" else "deg",
         )
     point_count_result = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events(frames)
     result.update(point_count_result)
     result["overall_pass"] = result["overall_pass"] and result["point_count_pass"]
+    continuity_result = build_single_point_continuity_result(
+        list(result.get("matched_frames", [])),
+        first_frame=result.get("first_frame"),
+        last_frame=result.get("last_frame"),
+    )
 
     print()
     report = build_fixed_recording_report(
@@ -891,6 +1396,8 @@ def analyze_fixed_recording(
         alarm_summary,
         validation_mode=validation_mode,
     )
+    report = append_fixed_tolerance_note(report, scenario, validation_mode)
+    report = append_point_continuity_summary(report, continuity_result, label="target")
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
@@ -925,9 +1432,11 @@ def analyze_m1_resolution(
 
     for _ in range(5):
         test_gap = round((low + high) / 2, 3)
-        sim.set_object_range(1, base_range_1)
-        sim.set_object_range(2, base_range_1 + test_gap)
-        frame_path = record_once(main_win, seconds=5)
+        def configure_targets() -> None:
+            sim.set_object_range(1, base_range_1)
+            sim.set_object_range(2, base_range_1 + test_gap)
+
+        frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
         frame_path = rename_recording_folder(frame_path, profile, selection)
         frames = parse_frames(frame_path)
         analysis = analyze_two_target_resolution(
@@ -955,10 +1464,18 @@ def analyze_m1_resolution(
         "resolution_before_merge_m": round(best_resolved_gap, 3),
         "merge_threshold_m": round(low, 3),
     }
-    result["resolution_pass"] = result["resolution_before_merge_m"] < 0.85
+    resolution_threshold_m = float(scenario.get("resolution_threshold_m", 0.85))
+    result["resolution_threshold_m"] = resolution_threshold_m
+    result["resolution_pass"] = result["resolution_before_merge_m"] < resolution_threshold_m
     result["overall_pass"] = result["continuity_pass"] and result["resolution_pass"] and result["point_count_pass"]
+    continuity_result = build_single_point_continuity_result(
+        list(result.get("resolved_frames", [])),
+        first_frame=(min(result["resolved_frames"]) if result.get("resolved_frames") else None),
+        last_frame=(max(result["resolved_frames"]) if result.get("resolved_frames") else None),
+    )
 
     report = build_multi_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
+    report = append_point_continuity_summary(report, continuity_result, label="target")
     print()
     print(report, end="")
     log_path = write_receding_recording_log(
@@ -994,9 +1511,11 @@ def analyze_m2_speed_resolution(
 
     for _ in range(5):
         test_gap = round((low + high) / 2, 3)
-        sim.set_object_speed(1, -speed_1)
-        sim.set_object_speed(2, -(speed_1 + test_gap))
-        frame_path = record_once(main_win, seconds=5)
+        def configure_targets() -> None:
+            sim.set_object_speed(1, -speed_1)
+            sim.set_object_speed(2, -(speed_1 + test_gap))
+
+        frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
         frame_path = rename_recording_folder(frame_path, profile, selection)
         frames = parse_frames(frame_path)
         analysis = analyze_two_target_speed_resolution(
@@ -1024,10 +1543,18 @@ def analyze_m2_speed_resolution(
         "resolution_before_merge_mps": round(best_resolved_gap, 3),
         "merge_threshold_mps": round(low, 3),
     }
-    result["resolution_pass"] = result["resolution_before_merge_mps"] < 0.2
+    speed_resolution_threshold_mps = float(scenario.get("speed_resolution_threshold_mps", 0.2))
+    result["speed_resolution_threshold_mps"] = speed_resolution_threshold_mps
+    result["resolution_pass"] = result["resolution_before_merge_mps"] < speed_resolution_threshold_mps
     result["overall_pass"] = result["continuity_pass"] and result["resolution_pass"] and result["point_count_pass"]
+    continuity_result = build_single_point_continuity_result(
+        list(result.get("resolved_frames", [])),
+        first_frame=(min(result["resolved_frames"]) if result.get("resolved_frames") else None),
+        last_frame=(max(result["resolved_frames"]) if result.get("resolved_frames") else None),
+    )
 
     report = build_multi_speed_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
+    report = append_point_continuity_summary(report, continuity_result, label="target")
     print()
     print(report, end="")
     log_path = write_receding_recording_log(
@@ -1061,9 +1588,20 @@ def analyze_speed_sweep_recording(
     result.update(analyze_expected_point_count(frames, expected_point_count=2))
     alarm_summary = summarize_alarm_events(frames)
     result["overall_pass"] = result["speed_range_pass"] and result["point_count_pass"]
+    track_build_result = build_speed_sweep_track_build_result(
+        result,
+        frame_limit=dynamic_track_build_frame_limit(scenario),
+    )
+    continuity_result = build_single_point_continuity_result(
+        list(result.get("matched_frames", [])),
+        first_frame=(min(result["matched_frames"]) if result.get("matched_frames") else None),
+        last_frame=(max(result["matched_frames"]) if result.get("matched_frames") else None),
+    )
 
     print()
     report = build_speed_sweep_report(frame_path, profile, selection, scenario, result, alarm_summary)
+    report = append_dynamic_track_build_summary(report, track_build_result)
+    report = append_point_continuity_summary(report, continuity_result, label="target")
     print(report, end="")
     log_path = write_receding_recording_log(
         frame_path,
@@ -1102,22 +1640,30 @@ def automation_loop(sim: RadarTargetSimulator, seconds: int) -> None:
 
         thread = None
         try:
-            thread = start_simulation(sim, selection)
             kind, scenario_id = selection
-            if kind == "multi" and sim.profile.key == "xiaoniu" and scenario_id == 1:
+            if kind == "multi" and "resolution_threshold_m" in sim.profile.multi_targets[scenario_id]:
                 scenario = sim.profile.multi_targets[scenario_id]
+                sim.run_multi(scenario_id)
                 analyze_m1_resolution(sim, main_win, sim.profile, selection, scenario)
-            elif kind == "multi" and sim.profile.key == "xiaoniu" and scenario_id == 2:
+            elif kind == "multi" and "speed_resolution_threshold_mps" in sim.profile.multi_targets[scenario_id]:
                 scenario = sim.profile.multi_targets[scenario_id]
+                sim.run_multi(scenario_id)
                 analyze_m2_speed_resolution(sim, main_win, sim.profile, selection, scenario)
             else:
                 record_seconds = auto_record_seconds(selection, sim.profile, seconds)
-                frame_path = record_once(main_win, seconds=record_seconds)
+                def start_after_recording() -> None:
+                    nonlocal thread
+                    thread = begin_simulation(sim, selection)
+                frame_path = record_once(
+                    main_win,
+                    seconds=record_seconds,
+                    on_recording_started=start_after_recording,
+                )
                 frame_path = rename_recording_folder(frame_path, sim.profile, selection)
                 print("[INFO] Simulation and recording complete.")
                 if kind == "dynamic":
                     scenario = sim.profile.dynamic_scenarios[scenario_id]
-                    if "speed_min" in scenario and "speed_max" in scenario and sim.profile.key == "xiaoniu" and scenario_id == 7:
+                    if "speed_min" in scenario and "speed_max" in scenario:
                         analyze_speed_sweep_recording(frame_path, sim.profile, selection, scenario)
                     elif is_receding_dynamic_scenario(scenario):
                         analyze_receding_recording(frame_path, sim.profile, selection, scenario)
@@ -1141,6 +1687,35 @@ def automation_loop(sim: RadarTargetSimulator, seconds: int) -> None:
                                 selection,
                                 scenario,
                                 validation_mode="speed",
+                            )
+                    elif sim.profile.key == "aima" and scenario.get("rcs") == 10:
+                        if scenario.get("speed") == 10 and 5 <= scenario.get("range", 0) <= 70:
+                            analyze_fixed_recording(
+                                frame_path,
+                                sim.profile,
+                                selection,
+                                scenario,
+                                validation_mode="range",
+                            )
+                        elif scenario.get("range") == 10 and -27.78 <= scenario.get("speed", 0) <= 27.78:
+                            analyze_fixed_recording(
+                                frame_path,
+                                sim.profile,
+                                selection,
+                                scenario,
+                                validation_mode="speed",
+                            )
+                        elif (
+                            scenario.get("speed") == 10
+                            and scenario.get("range") == 10
+                            and "angle_error_tolerance_deg" in scenario
+                        ):
+                            analyze_fixed_recording(
+                                frame_path,
+                                sim.profile,
+                                selection,
+                                scenario,
+                                validation_mode="angle",
                             )
         finally:
             stop_simulation(sim, thread)

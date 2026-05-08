@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import radar_can_tool as recorder
@@ -123,7 +124,11 @@ def find_new_frame_file(before_dirs: set[Path], base: Path | None = None) -> Pat
     raise RuntimeError("Could not find new frame.txt")
 
 
-def record_once(main_win, seconds: int = 5) -> Path:
+def record_once(
+    main_win,
+    seconds: int = 5,
+    on_recording_started: Callable[[], None] | None = None,
+) -> Path:
     if not isinstance(seconds, int) or seconds <= 0:
         raise ValueError("seconds must be a positive integer")
 
@@ -132,10 +137,15 @@ def record_once(main_win, seconds: int = 5) -> Path:
     recorder.click_record_button(main_win)
     recorder.confirm_point_cloud_only_recording()
 
-    print(f"[INFO] Recording for {seconds} seconds...")
-    time.sleep(seconds)
+    try:
+        if on_recording_started is not None:
+            print("[INFO] Recording started; triggering synchronized simulator action...")
+            on_recording_started()
 
-    print("[INFO] Stop recording...")
-    recorder.click_record_button(main_win)
-    time.sleep(1)
+        print(f"[INFO] Recording for {seconds} seconds...")
+        time.sleep(seconds)
+    finally:
+        print("[INFO] Stop recording...")
+        recorder.click_record_button(main_win)
+        time.sleep(1)
     return find_new_frame_file(before_dirs)

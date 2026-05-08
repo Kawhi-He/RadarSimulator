@@ -155,6 +155,19 @@ pip install RsInstrument psutil pywinauto pywin32
 
 横向稳定性基于目标轨迹的 `AngleAZ` 和横向偏移统计，日志会给出每个周期的 `stable`、`noticeable jitter` 或 `left-right crossing`。
 
+横向稳定性判定逻辑：
+
+- 先按单个周期内匹配到的目标点统计 `AngleAZ` 的最小值、最大值、跨度 `angle_span` 和标准差 `angle_std`。
+- 如果同时满足 `min_angle < -0.15°` 且 `max_angle > 0.15°`，判定为 `left-right crossing`，表示目标角度左右穿过中心线。
+- 否则，如果 `angle_span > 0.3°` 或 `angle_std > 0.12°`，判定为 `noticeable jitter`，表示横向抖动明显。
+- 其他情况判定为 `stable`。
+
+横向稳定性摘要逻辑：
+
+- 如果所有周期都是 `stable`，日志输出“所有周期横向稳定，无明显左右漂动”。
+- 如果既有 `stable` 周期，也有非 `stable` 周期，日志输出 `mixed results, X stable cycle(s), Y unstable cycle(s)`。
+- 如果所有周期都不是 `stable`，日志输出“所有周期都存在明显横向漂移或抖动”。
+
 ### 动态接近目标
 
 接近动态场景会输出：

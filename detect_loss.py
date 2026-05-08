@@ -14,6 +14,7 @@ class RadarPoint:
 
 @dataclass(frozen=True)
 class RadarObject:
+    object_id: int
     dist_lat: float
     dist_long: float
     vre_lat: float
@@ -173,6 +174,7 @@ def find_fixed_target_track(
     if not detections:
         return {
             "detections": 0,
+            "matched_frames": [],
             "first_frame": None,
             "last_frame": None,
             "frame_count": len(frames),
@@ -234,6 +236,7 @@ def find_fixed_target_track(
 
     return {
         "detections": len(detections),
+        "matched_frames": [item["frame_idx"] for item in detections],
         "first_frame": detections[0]["frame_idx"],
         "last_frame": detections[-1]["frame_idx"],
         "frame_count": len(frames),
@@ -287,6 +290,7 @@ def analyze_two_target_resolution(
     current_unresolved_start = None
     longest_unresolved_run = None
     unresolved_frames = []
+    resolved_frames = []
     resolved_frame_count = 0
     resolved_ranges = []
 
@@ -302,6 +306,7 @@ def analyze_two_target_resolution(
             consecutive_unresolved = 0
             current_unresolved_start = None
             resolved_frame_count += 1
+            resolved_frames.append(frame_idx)
             resolved_ranges.append(tuple(sorted(obj.dist_long for obj in candidates[:2])))
             continue
 
@@ -321,6 +326,7 @@ def analyze_two_target_resolution(
     return {
         "frame_count": len(frames),
         "resolved_frame_count": resolved_frame_count,
+        "resolved_frames": resolved_frames,
         "unresolved_frame_count": len(unresolved_frames),
         "unresolved_frames": unresolved_frames,
         "max_consecutive_unresolved": max_consecutive_unresolved,
@@ -342,6 +348,7 @@ def analyze_two_target_speed_resolution(
     current_unresolved_start = None
     longest_unresolved_run = None
     unresolved_frames = []
+    resolved_frames = []
     resolved_frame_count = 0
     resolved_speeds = []
 
@@ -355,6 +362,7 @@ def analyze_two_target_speed_resolution(
             consecutive_unresolved = 0
             current_unresolved_start = None
             resolved_frame_count += 1
+            resolved_frames.append(frame_idx)
             resolved_speeds.append(tuple(sorted(abs(obj.vre_long) for obj in candidates[:2])))
             continue
 
@@ -374,6 +382,7 @@ def analyze_two_target_speed_resolution(
     return {
         "frame_count": len(frames),
         "resolved_frame_count": resolved_frame_count,
+        "resolved_frames": resolved_frames,
         "unresolved_frame_count": len(unresolved_frames),
         "unresolved_frames": unresolved_frames,
         "max_consecutive_unresolved": max_consecutive_unresolved,
@@ -429,6 +438,7 @@ def analyze_speed_sweep_coverage(
 ):
     observed_speeds = []
     matched_frame_indices = []
+    matched_items = []
 
     for frame_idx, frame in enumerate(frames, start=1):
         candidates = [
@@ -441,6 +451,7 @@ def analyze_speed_sweep_coverage(
         best_point = min(candidates, key=lambda point: abs(point.range_m - target_range))
         observed_speeds.append(best_point.velocity)
         matched_frame_indices.append(frame_idx)
+        matched_items.append({"frame_idx": frame_idx, "point": best_point, "frame": frame})
 
     if not observed_speeds:
         return {
@@ -452,6 +463,7 @@ def analyze_speed_sweep_coverage(
             "covered_speed_max": None,
             "missing_speed_bins": [],
             "speed_range_pass": False,
+            "matched_items": [],
         }
 
     observed_min = min(observed_speeds)
@@ -478,6 +490,7 @@ def analyze_speed_sweep_coverage(
         "covered_speed_max": round(max(observed_bins), 1),
         "missing_speed_bins": missing_bins,
         "speed_range_pass": observed_min <= speed_min and observed_max >= speed_max and not missing_bins,
+        "matched_items": matched_items,
     }
 
 
@@ -627,6 +640,52 @@ def _find_track_object(item, range_tolerance=4.0, velocity_tolerance=3.0):
     return candidates[0][2]
 
 
+def _predict_track_object(track, frames, frame_idx, range_tolerance=4.0, velocity_tolerance=3.0):
+    if frame_idx < 1 or frame_idx > len(frames):
+        return None
+
+    frame = frames[frame_idx - 1]
+    objects = frame.get("objects", [])
+    if not objects:
+        return None
+
+    items = sorted(track.get("items", []), key=lambda item: item.get("frame_idx", 0))
+    for item in items:
+        if item.get("frame_idx") == frame_idx:
+            return _find_track_object(
+                item,
+                range_tolerance=range_tolerance,
+                velocity_tolerance=velocity_tolerance,
+            )
+
+    anchors = [item for item in items if item.get("frame_idx") is not None and item.get("point") is not None]
+    if not anchors:
+        return objects[0] if len(objects) == 1 else None
+
+    previous_anchors = [item for item in anchors if item["frame_idx"] < frame_idx]
+    anchor = previous_anchors[-1] if previous_anchors else anchors[0]
+    anchor_point = anchor["point"]
+    frame_gap = frame_idx - anchor["frame_idx"]
+    expected_velocity = anchor_point.velocity
+    expected_range = anchor_point.range_m + expected_velocity * 0.1 * frame_gap
+
+    candidates = []
+    for obj in objects:
+        range_error = abs(obj.dist_long - expected_range)
+        velocity_error = abs(obj.vre_long - expected_velocity)
+        if range_error > range_tolerance:
+            continue
+        if velocity_tolerance is not None and velocity_error > velocity_tolerance:
+            continue
+        candidates.append((range_error, velocity_error, obj))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda value: (value[0], value[1]))
+    return candidates[0][2]
+
+
 def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocity_tolerance=3.0):
     alarm_labels = {
         0: "no alarm",
@@ -634,13 +693,35 @@ def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocit
         2: "right",
         3: "rear",
     }
-    first_alarm = None
-    last_alarm = None
-    farthest_distance_m = None
-    nearest_distance_m = None
-    min_velocity_mps = None
-    max_velocity_mps = None
-    alarm_types_seen = []
+    channel_configs = {
+        "alarm_type": {
+            "field": "alarm_type",
+            "labels": alarm_labels,
+            "active": lambda value: value != 0,
+        },
+        "rcw": {
+            "field": "rcw",
+            "labels": {1: "rcw"},
+            "active": lambda value: value != 0,
+        },
+        "bsd": {
+            "field": "bsd",
+            "labels": {1: "bsd"},
+            "active": lambda value: value != 0,
+        },
+    }
+    channel_states = {
+        key: {
+            "first_alarm": None,
+            "last_alarm": None,
+            "farthest_distance_m": None,
+            "nearest_distance_m": None,
+            "min_velocity_mps": None,
+            "max_velocity_mps": None,
+            "values_seen": [],
+        }
+        for key in channel_configs
+    }
     matched_object_frame_count = 0
     skipped_alarm_frame_count = 0
 
@@ -650,8 +731,13 @@ def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocit
         if frame is None or frame_idx is None:
             continue
 
-        alarm_type = frame.get("alarm_type", 0)
-        if alarm_type == 0:
+        triggered_channels = []
+        for channel_key, config in channel_configs.items():
+            value = frame.get(config["field"], 0)
+            if config["active"](value):
+                triggered_channels.append((channel_key, value))
+
+        if not triggered_channels:
             continue
 
         best_object = _find_track_object(
@@ -667,34 +753,56 @@ def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocit
         alarm_velocity = best_object.vre_long
         matched_object_frame_count += 1
 
-        if first_alarm is None:
-            first_alarm = {
-                "alarm_type": alarm_type,
-                "earliest_distance_m": round(alarm_distance, 2),
-                "start_frame": frame_idx,
-            }
-        last_alarm = frame_idx
-        if alarm_type not in alarm_types_seen:
-            alarm_types_seen.append(alarm_type)
-        farthest_distance_m = alarm_distance if farthest_distance_m is None else max(farthest_distance_m, alarm_distance)
-        nearest_distance_m = alarm_distance if nearest_distance_m is None else min(nearest_distance_m, alarm_distance)
-        min_velocity_mps = alarm_velocity if min_velocity_mps is None else min(min_velocity_mps, alarm_velocity)
-        max_velocity_mps = alarm_velocity if max_velocity_mps is None else max(max_velocity_mps, alarm_velocity)
+        for channel_key, value in triggered_channels:
+            state = channel_states[channel_key]
+            if state["first_alarm"] is None:
+                state["first_alarm"] = {
+                    "value": value,
+                    "earliest_distance_m": round(alarm_distance, 2),
+                    "start_frame": frame_idx,
+                }
+            state["last_alarm"] = frame_idx
+            if value not in state["values_seen"]:
+                state["values_seen"].append(value)
+            state["farthest_distance_m"] = (
+                alarm_distance
+                if state["farthest_distance_m"] is None
+                else max(state["farthest_distance_m"], alarm_distance)
+            )
+            state["nearest_distance_m"] = (
+                alarm_distance
+                if state["nearest_distance_m"] is None
+                else min(state["nearest_distance_m"], alarm_distance)
+            )
+            state["min_velocity_mps"] = (
+                alarm_velocity
+                if state["min_velocity_mps"] is None
+                else min(state["min_velocity_mps"], alarm_velocity)
+            )
+            state["max_velocity_mps"] = (
+                alarm_velocity
+                if state["max_velocity_mps"] is None
+                else max(state["max_velocity_mps"], alarm_velocity)
+            )
 
     events = []
-    if first_alarm is not None and last_alarm is not None:
-        labels = [alarm_labels.get(value, f"unknown-{value}") for value in alarm_types_seen]
+    for channel_key, config in channel_configs.items():
+        state = channel_states[channel_key]
+        if state["first_alarm"] is None or state["last_alarm"] is None:
+            continue
+        labels = [config["labels"].get(value, f"{channel_key}-{value}") for value in state["values_seen"]]
         events.append(
             {
-                "alarm_type": "/".join(str(value) for value in alarm_types_seen),
+                "alarm_source": channel_key,
+                "alarm_type": "/".join(str(value) for value in state["values_seen"]),
                 "alarm_label": "/".join(labels),
-                "start_frame": first_alarm["start_frame"],
-                "end_frame": last_alarm,
-                "earliest_distance_m": first_alarm["earliest_distance_m"],
-                "farthest_distance_m": round(farthest_distance_m, 2),
-                "nearest_distance_m": round(nearest_distance_m, 2),
-                "min_velocity_mps": round(min_velocity_mps, 2),
-                "max_velocity_mps": round(max_velocity_mps, 2),
+                "start_frame": state["first_alarm"]["start_frame"],
+                "end_frame": state["last_alarm"],
+                "earliest_distance_m": state["first_alarm"]["earliest_distance_m"],
+                "farthest_distance_m": round(state["farthest_distance_m"], 2),
+                "nearest_distance_m": round(state["nearest_distance_m"], 2),
+                "min_velocity_mps": round(state["min_velocity_mps"], 2),
+                "max_velocity_mps": round(state["max_velocity_mps"], 2),
             }
         )
 
@@ -703,6 +811,217 @@ def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocit
         "alarm_event_count": len(events),
         "matched_object_frame_count": matched_object_frame_count,
         "skipped_alarm_frame_count": skipped_alarm_frame_count,
+    }
+
+
+def summarize_alarm_events_for_tracks(
+    tracks,
+    frames,
+    range_tolerance=4.0,
+    velocity_tolerance=3.0,
+    post_loss_alarm_frames=10,
+):
+    alarm_labels = {
+        0: "no alarm",
+        1: "left",
+        2: "right",
+        3: "rear",
+    }
+    channel_configs = {
+        "alarm_type": {
+            "field": "alarm_type",
+            "labels": alarm_labels,
+            "active": lambda value: value != 0,
+        },
+        "rcw": {
+            "field": "rcw",
+            "labels": {1: "rcw"},
+            "active": lambda value: value != 0,
+        },
+        "bsd": {
+            "field": "bsd",
+            "labels": {1: "bsd"},
+            "active": lambda value: value != 0,
+        },
+    }
+    events = []
+    matched_object_frame_count = 0
+    skipped_alarm_frame_count = 0
+    sorted_tracks = sorted(tracks, key=lambda track: track.get("first_frame", 0))
+
+    for cycle_index, track in enumerate(sorted_tracks, 1):
+        start_frame = track.get("first_frame")
+        if start_frame is None:
+            continue
+        loss_frame = track.get("loss_frame") or track.get("last_frame") or start_frame
+        next_start = (
+            sorted_tracks[cycle_index].get("first_frame")
+            if cycle_index < len(sorted_tracks)
+            else len(frames) + 1
+        )
+        end_frame = min(len(frames), next_start - 1, loss_frame + post_loss_alarm_frames)
+        channel_states = {
+            key: {
+                "first_alarm": None,
+                "last_alarm": None,
+                "farthest_distance_m": None,
+                "nearest_distance_m": None,
+                "min_velocity_mps": None,
+                "max_velocity_mps": None,
+                "values_seen": [],
+            }
+            for key in channel_configs
+        }
+
+        for frame_idx in range(start_frame, end_frame + 1):
+            frame = frames[frame_idx - 1]
+            triggered_channels = []
+            for channel_key, config in channel_configs.items():
+                value = frame.get(config["field"], 0)
+                if config["active"](value):
+                    triggered_channels.append((channel_key, value))
+
+            if not triggered_channels:
+                continue
+
+            best_object = _predict_track_object(
+                track,
+                frames,
+                frame_idx,
+                range_tolerance=range_tolerance,
+                velocity_tolerance=velocity_tolerance,
+            )
+            if best_object is None:
+                skipped_alarm_frame_count += 1
+                continue
+
+            alarm_distance = best_object.dist_long
+            alarm_velocity = best_object.vre_long
+            matched_object_frame_count += 1
+
+            for channel_key, value in triggered_channels:
+                state = channel_states[channel_key]
+                if state["first_alarm"] is None:
+                    state["first_alarm"] = {
+                        "value": value,
+                        "earliest_distance_m": round(alarm_distance, 2),
+                        "start_frame": frame_idx,
+                    }
+                state["last_alarm"] = frame_idx
+                if value not in state["values_seen"]:
+                    state["values_seen"].append(value)
+                state["farthest_distance_m"] = (
+                    alarm_distance
+                    if state["farthest_distance_m"] is None
+                    else max(state["farthest_distance_m"], alarm_distance)
+                )
+                state["nearest_distance_m"] = (
+                    alarm_distance
+                    if state["nearest_distance_m"] is None
+                    else min(state["nearest_distance_m"], alarm_distance)
+                )
+                state["min_velocity_mps"] = (
+                    alarm_velocity
+                    if state["min_velocity_mps"] is None
+                    else min(state["min_velocity_mps"], alarm_velocity)
+                )
+                state["max_velocity_mps"] = (
+                    alarm_velocity
+                    if state["max_velocity_mps"] is None
+                    else max(state["max_velocity_mps"], alarm_velocity)
+                )
+
+        for channel_key, config in channel_configs.items():
+            state = channel_states[channel_key]
+            if state["first_alarm"] is None or state["last_alarm"] is None:
+                continue
+            labels = [config["labels"].get(value, f"{channel_key}-{value}") for value in state["values_seen"]]
+            events.append(
+                {
+                    "cycle_index": cycle_index,
+                    "alarm_source": channel_key,
+                    "alarm_type": "/".join(str(value) for value in state["values_seen"]),
+                    "alarm_label": "/".join(labels),
+                    "start_frame": state["first_alarm"]["start_frame"],
+                    "end_frame": state["last_alarm"],
+                    "earliest_distance_m": state["first_alarm"]["earliest_distance_m"],
+                    "farthest_distance_m": round(state["farthest_distance_m"], 2),
+                    "nearest_distance_m": round(state["nearest_distance_m"], 2),
+                    "min_velocity_mps": round(state["min_velocity_mps"], 2),
+                    "max_velocity_mps": round(state["max_velocity_mps"], 2),
+                }
+            )
+
+    return {
+        "alarm_events": events,
+        "alarm_event_count": len(events),
+        "matched_object_frame_count": matched_object_frame_count,
+        "skipped_alarm_frame_count": skipped_alarm_frame_count,
+    }
+
+
+def summarize_track_object_ids(track, range_tolerance=4.0, velocity_tolerance=3.0):
+    matched_object_ids = []
+    matched_object_frames = []
+    matched_object_distances = []
+    matched_object_velocities = []
+    unmatched_frames = []
+    first_point_frame = None
+
+    for item in track.get("items", []):
+        frame_idx = item.get("frame_idx")
+        if frame_idx is not None and first_point_frame is None:
+            first_point_frame = frame_idx
+        best_object = _find_track_object(
+            item,
+            range_tolerance=range_tolerance,
+            velocity_tolerance=velocity_tolerance,
+        )
+        if best_object is None:
+            if frame_idx is not None:
+                unmatched_frames.append(frame_idx)
+            continue
+        matched_object_ids.append(best_object.object_id)
+        matched_object_distances.append(best_object.dist_long)
+        matched_object_velocities.append(best_object.vre_long)
+        if frame_idx is not None:
+            matched_object_frames.append(frame_idx)
+
+    unique_object_ids = []
+    for object_id in matched_object_ids:
+        if object_id not in unique_object_ids:
+            unique_object_ids.append(object_id)
+
+    object_id_jump_count = sum(
+        1
+        for prev_id, next_id in zip(matched_object_ids, matched_object_ids[1:])
+        if prev_id != next_id
+    )
+
+    return {
+        "matched_object_ids": matched_object_ids,
+        "matched_object_frames": matched_object_frames,
+        "matched_object_distances_m": [round(value, 2) for value in matched_object_distances],
+        "matched_object_velocities_mps": [round(value, 2) for value in matched_object_velocities],
+        "matched_object_frame_count": len(matched_object_frames),
+        "unmatched_object_frames": unmatched_frames,
+        "unique_object_ids": unique_object_ids,
+        "object_id_first": matched_object_ids[0] if matched_object_ids else None,
+        "object_id_last": matched_object_ids[-1] if matched_object_ids else None,
+        "object_id_jump_count": object_id_jump_count,
+        "object_id_stable": object_id_jump_count == 0 if matched_object_ids else None,
+        "first_point_frame": first_point_frame,
+        "object_build_frame": matched_object_frames[0] if matched_object_frames else None,
+        "object_build_frame_count": (
+            matched_object_frames[0] - first_point_frame + 1
+            if matched_object_frames and first_point_frame is not None
+            else None
+        ),
+        "object_build_distance_m": round(matched_object_distances[0], 2) if matched_object_distances else None,
+        "object_last_frame": matched_object_frames[-1] if matched_object_frames else None,
+        "object_last_distance_m": round(matched_object_distances[-1], 2) if matched_object_distances else None,
+        "object_farthest_distance_m": round(max(matched_object_distances), 2) if matched_object_distances else None,
+        "object_nearest_distance_m": round(min(matched_object_distances), 2) if matched_object_distances else None,
     }
 
 
@@ -721,6 +1040,10 @@ def parse_frames(filepath):
         point_num = int(point_num_match.group(1))
         alarm_type_match = re.search(r"AlarmType=(\d+)", block)
         alarm_type = int(alarm_type_match.group(1)) if alarm_type_match else 0
+        rcw_match = re.search(r"RCW=(\d+)", block)
+        rcw = int(rcw_match.group(1)) if rcw_match else 0
+        bsd_match = re.search(r"BSD=(\d+)", block)
+        bsd = int(bsd_match.group(1)) if bsd_match else 0
         object_num_match = re.search(r"ObjectNum=(\d+)", block)
         object_num = int(object_num_match.group(1)) if object_num_match else 0
         points = []
@@ -739,23 +1062,26 @@ def parse_frames(filepath):
             )
         objects = []
         for om in re.finditer(
-            r"\d+:DistLat=([-\d.]+) DistLong=([-\d.]+) VreLat=([-\d.]+) VreLong=([-\d.]+) Power=([-\d.]+) DynamicPro=([-\d.]+)",
+            r"(\d+):DistLat=([-\d.]+) DistLong=([-\d.]+) VreLat=([-\d.]+) VreLong=([-\d.]+) Power=([-\d.]+) DynamicPro=([-\d.]+)",
             block,
         ):
             objects.append(
                 RadarObject(
-                    dist_lat=float(om.group(1)),
-                    dist_long=float(om.group(2)),
-                    vre_lat=float(om.group(3)),
-                    vre_long=float(om.group(4)),
-                    power=float(om.group(5)),
-                    dynamic_pro=float(om.group(6)),
+                    object_id=int(om.group(1)),
+                    dist_lat=float(om.group(2)),
+                    dist_long=float(om.group(3)),
+                    vre_lat=float(om.group(4)),
+                    vre_long=float(om.group(5)),
+                    power=float(om.group(6)),
+                    dynamic_pro=float(om.group(7)),
                 )
             )
         frames.append(
             {
                 "point_num": point_num,
                 "alarm_type": alarm_type,
+                "rcw": rcw,
+                "bsd": bsd,
                 "object_num": object_num,
                 "ranges": [point.range_m for point in points],
                 "points": points,
@@ -1074,6 +1400,7 @@ def find_receding_target_tracks(
     range_prediction_tolerance=4.0,
     loss_gap_frames=3,
     min_detections=8,
+    require_complete_cycle=True,
 ):
     active_tracks = []
     finished_tracks = []
@@ -1147,23 +1474,34 @@ def find_receding_target_tracks(
         items = track["items"]
         if len(items) < min_detections:
             continue
+        if require_complete_cycle and track.get("loss_frame") is None:
+            continue
 
         points = [item["point"] for item in items]
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
         powers = [point.power for point in points]
+        object_build_frame_count = None
+        for item in items:
+            frame = item.get("frame")
+            if frame is not None and frame.get("object_num", 0) > 0:
+                object_build_frame_count = item["frame_idx"]
+                break
         lateral_summary = summarize_lateral_motion(points)
         tracks.append(
             {
                 "first_frame": items[0]["frame_idx"],
                 "last_frame": items[-1]["frame_idx"],
+                "matched_frames": [item["frame_idx"] for item in items],
                 "loss_frame": track.get("loss_frame"),
                 "duration_frames": items[-1]["frame_idx"] - items[0]["frame_idx"] + 1,
                 "detections": len(items),
+                "items": items,
                 "start_range_m": ranges[0],
                 "last_range_m": ranges[-1],
                 "max_range_m": max(ranges),
+                "object_build_frame_count": object_build_frame_count,
                 "avg_velocity": round(sum(velocities) / len(velocities), 2),
                 "avg_angle_az": round(sum(angles) / len(angles), 2),
                 "avg_power": round(sum(powers) / len(powers), 2),
@@ -1185,6 +1523,7 @@ def find_approaching_target_tracks(
     range_prediction_tolerance=4.0,
     loss_gap_frames=3,
     min_detections=8,
+    require_complete_cycle=True,
 ):
     active_tracks = []
     finished_tracks = []
@@ -1258,6 +1597,8 @@ def find_approaching_target_tracks(
         items = track["items"]
         if len(items) < min_detections:
             continue
+        if require_complete_cycle and track.get("loss_frame") is None:
+            continue
 
         points = [item["point"] for item in items]
         ranges = [point.range_m for point in points]
@@ -1269,6 +1610,7 @@ def find_approaching_target_tracks(
             {
                 "first_frame": items[0]["frame_idx"],
                 "last_frame": items[-1]["frame_idx"],
+                "matched_frames": [item["frame_idx"] for item in items],
                 "loss_frame": track.get("loss_frame"),
                 "duration_frames": items[-1]["frame_idx"] - items[0]["frame_idx"] + 1,
                 "detections": len(items),
