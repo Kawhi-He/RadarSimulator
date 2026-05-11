@@ -77,6 +77,15 @@ def snapshot_record_dirs(base: Path | None = None) -> set[Path]:
     return {path.resolve() for path in base.iterdir() if path.is_dir()}
 
 
+def wait_for_record_button_ready(main_win, timeout: int = 20) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if recorder.is_record_button_ready(main_win):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def rename_new_frame_file(before_dirs: set[Path], base: Path | None = None) -> Path:
     base = base or Path.cwd()
     current_dirs = {path.resolve() for path in base.iterdir() if path.is_dir()}
@@ -132,6 +141,9 @@ def record_once(
     if not isinstance(seconds, int) or seconds <= 0:
         raise ValueError("seconds must be a positive integer")
 
+    if not wait_for_record_button_ready(main_win):
+        raise RuntimeError("Record button did not become ready before starting a new recording")
+
     before_dirs = snapshot_record_dirs()
     print("[INFO] Start recording...")
     recorder.click_record_button(main_win)
@@ -148,4 +160,6 @@ def record_once(
         print("[INFO] Stop recording...")
         recorder.click_record_button(main_win)
         time.sleep(1)
+        if not wait_for_record_button_ready(main_win):
+            print("[WARN] Record button did not become ready immediately after stopping.")
     return find_new_frame_file(before_dirs)

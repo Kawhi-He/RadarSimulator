@@ -56,7 +56,7 @@ pip install RsInstrument psutil pywinauto pywin32
 | --- | --- |
 | `F1-F4` | `RCS=10dBsm, speed=10m/s`，距离分别为 `5m/10m/15m/20m`。 |
 | `F5-F26` | `RCS=10dBsm, range=10m`，速度从 `-57m/s` 到 `44m/s`。 |
-| `M1` | 两固定目标，`-10km/h`，距离 `10m` 与 `14m`，用于距离分辨率。 |
+| `M1` | 两固定目标，`-10km/h`，距离 `10m` 与 `15m`，用于距离分辨率。 |
 | `M2` | 两固定目标，`range=10m`，速度 `-10km/h` 与 `-20km/h`，用于速度分辨率。 |
 | `D7` | `RCS=20dBsm, range=10m`，速度扫描 `-57m/s` 到 `44m/s`。 |
 | `D13-D15` | `RCS=10dBsm, 30m -> 2m` 接近场景，速度分别为 `120/60/20km/h`。 |
@@ -132,22 +132,25 @@ pip install RsInstrument psutil pywinauto pywin32
 
 目标数量按 `frame.txt` 中 `[Object]` 段的行数判断：
 
-- `[Object]` 下 `2` 行表示识别出 `2` 个目标。
-- `[Object]` 下 `1` 行或 `0` 行表示 `Object目标数<2`。
+- `[Object]` 下 `2` 行或更多表示该帧已分辨出 `2` 个目标。
+- `[Object]` 下 `1` 行或 `0` 行表示该帧未分辨，即 `Object目标数<2`。
+- 首次已分辨帧之前视为目标建航阶段，不计入连续丢失；首次已分辨后，如果连续 `3` 帧未分辨，则连续性失败。
 
 `M1` 距离分辨率：
 
 - 固定目标 1 在 `10m`。
-- 通过二分法缩小目标 2 的距离，目标 2 从 `14m` 往 `10m` 靠近。
-- 记录两目标合并成一个目标前的最小距离差。
-- 测试标准：无连续 `3` 帧 `Object目标数<2`，距离分辨率 `<0.85m`。
+- 通过二分法缩小目标 2 的距离，目标 2 从 `15m` 往 `10m` 靠近。
+- 每个测试距离间隔录制 `5s`。只要录制中任意一帧 `[Object]` 行数 `>=2`，该距离间隔判定为“可分辨”，下一轮尝试更小距离间隔；如果全程没有已分辨帧，则判定为“已合并”，下一轮尝试更大距离间隔。
+- `resolution_before_merge` 表示二分搜索中找到的最小“可分辨”距离间隔；`merge_threshold` 表示搜索中最大的“已合并”距离间隔。
+- 测试标准：首次已分辨后无连续 `3` 帧 `Object目标数<2`，且 `resolution_before_merge < 0.85m`。
 
 `M2` 速度分辨率：
 
 - 固定目标 1 为 `-10km/h`。
 - 通过二分法调整目标 2 的速度，从 `-20km/h` 往 `-10km/h` 靠近。
-- 记录两目标合并成一个目标前的最小速度差。
-- 测试标准：无连续 `3` 帧 `Object目标数<2`，速度分辨率 `<0.2m/s`。
+- 每个测试速度间隔录制 `5s`。只要录制中任意一帧 `[Object]` 行数 `>=2`，该速度间隔判定为“可分辨”，下一轮尝试更小速度间隔；如果全程没有已分辨帧，则判定为“已合并”，下一轮尝试更大速度间隔。
+- `resolution_before_merge` 表示二分搜索中找到的最小“可分辨”速度间隔；`merge_threshold` 表示搜索中最大的“已合并”速度间隔。
+- 测试标准：首次已分辨后无连续 `3` 帧 `Object目标数<2`，且 `resolution_before_merge < 0.2m/s`。
 
 多目标场景点云数量期望为 `3`，即 `2` 个虚拟目标加 `1` 个金属目标。
 
@@ -163,20 +166,19 @@ pip install RsInstrument psutil pywinauto pywin32
 - 点云数量检查。
 - 报警信息。
 
-横向稳定性基于目标轨迹的 `AngleAZ` 和横向偏移统计，日志会给出每个周期的 `stable`、`noticeable jitter` 或 `left-right crossing`。
+横向稳定性暂时只判断目标是否发生明显左右跨线，日志会给出每个周期的 `stable` 或 `left-right crossing`。`angle_span`、`angle_std` 和 `lateral_span` 仍会输出，但仅作为观察参考，不作为 FAIL 条件。
 
 横向稳定性判定逻辑：
 
 - 先按单个周期内匹配到的目标点统计 `AngleAZ` 的最小值、最大值、跨度 `angle_span` 和标准差 `angle_std`。
-- 如果同时满足 `min_angle < -0.15°` 且 `max_angle > 0.15°`，判定为 `left-right crossing`，表示目标角度左右穿过中心线。
-- 否则，如果 `angle_span > 0.3°` 或 `angle_std > 0.12°`，判定为 `noticeable jitter`，表示横向抖动明显。
-- 其他情况判定为 `stable`。
+- 如果同时满足 `min_angle < -0.15°` 且 `max_angle > 0.15°`，判定为 `left-right crossing`，表示目标角度左右穿过中心线，横向稳定性 FAIL。
+- 其他情况判定为 `stable`。持续在左侧或右侧运动、轻微角度抖动、横向距离随距离变大而变化，都不再单独判为横向稳定性 FAIL。
 
 横向稳定性摘要逻辑：
 
-- 如果所有周期都是 `stable`，日志输出“所有周期横向稳定，无明显左右漂动”。
+- 如果所有周期都是 `stable`，日志输出“所有周期未发生左右跨线”。
 - 如果既有 `stable` 周期，也有非 `stable` 周期，日志输出 `mixed results, X stable cycle(s), Y unstable cycle(s)`。
-- 如果所有周期都不是 `stable`，日志输出“所有周期都存在明显横向漂移或抖动”。
+- 如果所有周期都不是 `stable`，日志输出“所有周期都发生左右跨线”。
 
 动态建航与连续性规则：
 

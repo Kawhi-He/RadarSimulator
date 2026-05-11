@@ -11,7 +11,7 @@ from typing import Any
 
 from RsInstrument import RsInstrument
 
-from radar_scenarios import BrandProfile
+from radar_scenarios import BrandProfile, ScenarioId
 
 
 Number = int | float
@@ -135,7 +135,7 @@ class RadarTargetSimulator(AbstractContextManager["RadarTargetSimulator"]):
     def reset_stop_flag(self) -> None:
         self._stop_event.clear()
 
-    def run_dynamic(self, scenario_id: int) -> None:
+    def run_dynamic(self, scenario_id: ScenarioId) -> None:
         scenario = self._get_scenario(self.profile.dynamic_scenarios, scenario_id, "dynamic scenario")
         if "speed_min" in scenario:
             self._run_speed_sweep(scenario)
@@ -183,13 +183,17 @@ class RadarTargetSimulator(AbstractContextManager["RadarTargetSimulator"]):
         self.instr.close()
 
     @staticmethod
-    def _get_scenario(scenarios: Mapping[int, Mapping[str, Any]], scenario_id: int, label: str) -> Mapping[str, Any]:
-        if not isinstance(scenario_id, int):
-            raise ValueError(f"{label} id must be an integer")
+    def _get_scenario(
+        scenarios: Mapping[ScenarioId, Mapping[str, Any]],
+        scenario_id: ScenarioId,
+        label: str,
+    ) -> Mapping[str, Any]:
+        if not isinstance(scenario_id, (int, str)) or isinstance(scenario_id, bool):
+            raise ValueError(f"{label} id must be an integer or string")
         try:
             return scenarios[scenario_id]
         except KeyError as exc:
-            valid_ids = ", ".join(str(key) for key in sorted(scenarios))
+            valid_ids = ", ".join(str(key) for key in scenarios)
             raise ValueError(f"invalid {label} id {scenario_id}; valid ids: {valid_ids}") from exc
 
     def _run_range_motion(self, scenario: Mapping[str, Any]) -> None:

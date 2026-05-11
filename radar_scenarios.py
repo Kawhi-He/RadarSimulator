@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
 
-ScenarioMap = Mapping[int, Mapping[str, Any]]
+ScenarioId = int | str
+ScenarioMap = Mapping[ScenarioId, Mapping[str, Any]]
+XIAONIU_DYNAMIC_ANGLE_TOLERANCE_RAD = 0.35
 
 
 @dataclass(frozen=True)
@@ -22,26 +25,59 @@ class BrandProfile:
 
     @property
     def dynamic_ids(self) -> str:
-        ids = sorted(self.dynamic_scenarios)
-        return f"{ids[0]}-{ids[-1]}" if ids else ""
+        return _format_scenario_ids(self.dynamic_scenarios)
 
     @property
     def fixed_ids(self) -> str:
-        ids = sorted(self.fixed_targets)
-        return f"F{ids[0]}-F{ids[-1]}" if ids else ""
+        return _format_scenario_ids(self.fixed_targets, prefix="F")
 
     @property
     def multi_ids(self) -> str:
-        ids = sorted(self.multi_targets)
-        return f"M{ids[0]}-M{ids[-1]}" if ids else ""
+        return _format_scenario_ids(self.multi_targets, prefix="M")
 
 
-def _freeze(data: dict[int, dict[str, Any]]) -> ScenarioMap:
-    return MappingProxyType({key: MappingProxyType(value) for key, value in data.items()})
+def _format_scenario_ids(scenarios: ScenarioMap, prefix: str = "") -> str:
+    int_ids = [
+        scenario_id
+        for scenario_id in scenarios
+        if isinstance(scenario_id, int) and not isinstance(scenario_id, bool)
+    ]
+    other_ids = [
+        scenario_id
+        for scenario_id in scenarios
+        if not (isinstance(scenario_id, int) and not isinstance(scenario_id, bool))
+    ]
+    parts: list[str] = []
+    if int_ids:
+        ordered = sorted(int_ids)
+        if ordered == list(range(ordered[0], ordered[-1] + 1)):
+            parts.append(f"{prefix}{ordered[0]}-{prefix}{ordered[-1]}")
+        else:
+            parts.extend(f"{prefix}{scenario_id}" for scenario_id in ordered)
+    parts.extend(f"{prefix}{scenario_id}" for scenario_id in sorted(other_ids, key=_scenario_sort_key))
+    return ", ".join(parts)
 
 
-def _freeze_multi(data: dict[int, dict[str, Any]]) -> ScenarioMap:
-    frozen: dict[int, Mapping[str, Any]] = {}
+def _scenario_sort_key(scenario_id: ScenarioId) -> tuple[int, int, int, str]:
+    if isinstance(scenario_id, int) and not isinstance(scenario_id, bool):
+        return (0, scenario_id, 0, str(scenario_id))
+    if isinstance(scenario_id, str):
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", scenario_id)
+        if match is not None:
+            major = int(match.group(1))
+            minor = int(match.group(2) or 0)
+            return (0, major, minor, scenario_id)
+        return (1, 0, 0, scenario_id)
+    return (2, 0, 0, str(scenario_id))
+
+
+def _freeze(data: dict[ScenarioId, dict[str, Any]], defaults: Mapping[str, Any] | None = None) -> ScenarioMap:
+    defaults = defaults or {}
+    return MappingProxyType({key: MappingProxyType({**defaults, **value}) for key, value in data.items()})
+
+
+def _freeze_multi(data: dict[ScenarioId, dict[str, Any]]) -> ScenarioMap:
+    frozen: dict[ScenarioId, Mapping[str, Any]] = {}
     for key, value in data.items():
         targets = tuple(MappingProxyType(target) for target in value["targets"])
         frozen[key] = MappingProxyType({**value, "targets": targets})
@@ -55,6 +91,14 @@ XIAONIU_PROFILE = BrandProfile(
         {
             1: {"desc": "RCS=30dBsm, 150m -> 20m, 10m/s approaching", "rcs": 30, "r_start": 150, "r_end": 20, "speed": -10},
             2: {"desc": "RCS=10dBsm, 2m -> 150m, 10m/s receding", "rcs": 10, "r_start": 2, "r_end": 150, "speed": 10},
+            "2-1": {
+                "desc": "RCS=10dBsm, 2m -> 80m, 10m/s receding (1 cycle)",
+                "rcs": 10,
+                "r_start": 2,
+                "r_end": 80,
+                "speed": 10,
+                "record_cycles": 1,
+            },
             3: {"desc": "RCS=5dBsm, 2m -> 150m, 10m/s receding", "rcs": 5, "r_start": 2, "r_end": 150, "speed": 10},
             4: {"desc": "RCS=0dBsm, 2m -> 150m, 10m/s receding", "rcs": 0, "r_start": 2, "r_end": 150, "speed": 10},
             5: {"desc": "RCS=40dBsm, 20m -> 100m, 10m/s receding", "rcs": 40, "r_start": 20, "r_end": 100, "speed": 10},
@@ -76,7 +120,8 @@ XIAONIU_PROFILE = BrandProfile(
                 "speed": -25,
                 "start_range_min": 40,
             },
-        }
+        },
+        defaults={"dynamic_angle_tolerance": XIAONIU_DYNAMIC_ANGLE_TOLERANCE_RAD},
     ),
     fixed_targets=_freeze(
         {
@@ -110,8 +155,22 @@ XIAONIU_PROFILE = BrandProfile(
     ),
     multi_targets=_freeze_multi(
         {
-            1: {"desc": "Two fixed targets: RCS=10dBsm, speed=-10km/h, range=10m vs 14m", "targets": [{"rcs": 10, "range": 10, "speed": -2.78}, {"rcs": 10, "range": 14, "speed": -2.78}]},
-            2: {"desc": "Two fixed targets: RCS=10dBsm, range=10m, speed=-10km/h vs -20km/h", "targets": [{"rcs": 10, "range": 10, "speed": -2.78}, {"rcs": 10, "range": 10, "speed": -5.56}]},
+            1: {
+                "desc": "Two fixed targets: RCS=10dBsm, speed=-10km/h, range=10m vs 15m",
+                "targets": [
+                    {"rcs": 10, "range": 10, "speed": -2.78},
+                    {"rcs": 10, "range": 15, "speed": -2.78},
+                ],
+                "resolution_threshold_m": 0.85,
+            },
+            2: {
+                "desc": "Two fixed targets: RCS=10dBsm, range=10m, speed=-10km/h vs -20km/h",
+                "targets": [
+                    {"rcs": 10, "range": 10, "speed": -2.78},
+                    {"rcs": 10, "range": 10, "speed": -5.56},
+                ],
+                "speed_resolution_threshold_mps": 0.2,
+            },
         }
     ),
 )

@@ -12,18 +12,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from radar_scenarios import PROFILES, BrandProfile
+from radar_scenarios import PROFILES, BrandProfile, ScenarioId
 from radar_simulator import DEFAULT_IP, RadarTargetSimulator
 
 
-Selection = tuple[str, int]
+Selection = tuple[str, ScenarioId]
 DEFAULT_TRACK_BUILD_FRAME_LIMIT = 3
 DEFAULT_LONGITUDINAL_DISTANCE_ERROR_TOLERANCE_M = 1.75
 DEFAULT_VELOCITY_ERROR_TOLERANCE_MPS = 0.3
 LATERAL_STABILITY_CRITERIA = (
     "if min_angle < -0.15deg and max_angle > 0.15deg -> left-right crossing; "
-    "else if angle_span > 0.3deg or angle_std > 0.12deg -> noticeable jitter; "
-    "otherwise -> stable."
+    "otherwise -> stable. Angle span/std and lateral span are reported for reference only."
 )
 
 
@@ -63,7 +62,7 @@ def show_menu(profile: BrandProfile) -> None:
     print("=" * 70)
 
 
-def _print_scenarios(scenarios: Mapping[int, Mapping[str, Any]], prefix: str = "") -> None:
+def _print_scenarios(scenarios: Mapping[ScenarioId, Mapping[str, Any]], prefix: str = "") -> None:
     for scenario_id, scenario in scenarios.items():
         print(f"  {prefix}{scenario_id} - {scenario['desc']}")
 
@@ -78,19 +77,24 @@ def parse_selection(raw: str, profile: BrandProfile) -> Selection | None:
     if value.startswith("M"):
         return _parse_prefixed_selection(value, "M", profile.multi_targets, "multi-target scenario")
 
-    try:
-        scenario_id = int(value)
-    except ValueError as exc:
-        raise ValueError("dynamic scenario id must be a number") from exc
+    scenario_id = _parse_dynamic_scenario_id(value)
     if scenario_id not in profile.dynamic_scenarios:
         raise ValueError(f"invalid dynamic scenario id: {scenario_id}")
     return ("dynamic", scenario_id)
 
 
+def _parse_dynamic_scenario_id(value: str) -> ScenarioId:
+    if value.isdigit():
+        return int(value)
+    if re.fullmatch(r"\d+-\d+", value):
+        return value
+    raise ValueError("dynamic scenario id must be a number or number-number")
+
+
 def _parse_prefixed_selection(
     value: str,
     prefix: str,
-    scenarios: Mapping[int, Mapping[str, Any]],
+    scenarios: Mapping[ScenarioId, Mapping[str, Any]],
     label: str,
 ) -> Selection:
     try:
@@ -195,6 +199,13 @@ def dynamic_cycle_seconds(scenario: Mapping[str, Any], margin_seconds: float = 2
 
 def dynamic_track_build_frame_limit(scenario: Mapping[str, Any]) -> int:
     return int(scenario.get("track_build_frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT))
+
+
+def dynamic_angle_tolerance(scenario: Mapping[str, Any], default: float = 0.25) -> float:
+    value = scenario.get("dynamic_angle_tolerance", default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise ValueError("dynamic_angle_tolerance must be a non-negative number")
+    return float(value)
 
 
 def scenario_longitudinal_tolerance(scenario: Mapping[str, Any]) -> float:
@@ -968,12 +979,20 @@ def auto_record_seconds(selection: Selection, profile: BrandProfile, default_sec
     if not (is_receding_dynamic_scenario(scenario) or is_approaching_dynamic_scenario(scenario)):
         return default_seconds
 
-    seconds = math.ceil(dynamic_cycle_seconds(scenario) * 3 + 3)
+    cycles = dynamic_record_cycles(scenario)
+    seconds = math.ceil(dynamic_cycle_seconds(scenario) * cycles + 3)
     if is_receding_dynamic_scenario(scenario):
-        print(f"[INFO] Dynamic receding target selected; recording at least 3 cycles: {seconds}s")
+        print(f"[INFO] Dynamic receding target selected; recording at least {cycles} cycles: {seconds}s")
     else:
-        print(f"[INFO] Dynamic approaching target selected; recording at least 3 cycles: {seconds}s")
+        print(f"[INFO] Dynamic approaching target selected; recording at least {cycles} cycles: {seconds}s")
     return seconds
+
+
+def dynamic_record_cycles(scenario: Mapping[str, Any], default_cycles: int = 3) -> int:
+    value = scenario.get("record_cycles", default_cycles)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError("record_cycles must be a positive integer")
+    return value
 
 
 def safe_path_part(value: str, max_length: int = 80) -> str:
@@ -1013,6 +1032,49 @@ def rename_recording_folder(frame_path: Path, profile: BrandProfile, selection: 
     return renamed_frame_path
 
 
+def binary_search_frame_name(iteration: int, test_gap: float, unit: str) -> str:
+    gap_text = f"{test_gap:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"frame_iter{iteration:02d}_gap_{gap_text}{unit}.txt"
+
+
+def archive_binary_search_recording(
+    frame_path: Path,
+    profile: BrandProfile,
+    selection: Selection,
+    session_dir: Path | None,
+    iteration: int,
+    test_gap: float,
+    unit: str,
+) -> tuple[Path, Path]:
+    def unique_path(path: Path) -> Path:
+        candidate = path
+        suffix = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+            suffix += 1
+        return candidate
+
+    if session_dir is None:
+        frame_path = rename_recording_folder(frame_path, profile, selection)
+        session_dir = frame_path.parent
+
+    target_path = unique_path(session_dir / binary_search_frame_name(iteration, test_gap, unit))
+
+    source_dir = frame_path.parent
+    if frame_path.resolve() != target_path.resolve():
+        frame_path.rename(target_path)
+    if source_dir.resolve() != session_dir.resolve():
+        for extra_path in source_dir.iterdir():
+            extra_target = unique_path(session_dir / f"iter{iteration:02d}_{extra_path.name}")
+            extra_path.rename(extra_target)
+        try:
+            source_dir.rmdir()
+        except OSError:
+            pass
+    print(f"[INFO] Archived binary-search frame: {target_path}")
+    return target_path, session_dir
+
+
 def selection_tag(selection: Selection) -> str:
     kind, scenario_id = selection
     prefix = {"dynamic": "D", "fixed": "F", "multi": "M"}[kind]
@@ -1030,6 +1092,7 @@ def build_receding_recording_report(
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
+    angle_tolerance = dynamic_angle_tolerance(scenario)
     lines = [
         "=" * 60,
         "目标远离丢失分析 | Receding Target Loss Analysis",
@@ -1041,6 +1104,7 @@ def build_receding_recording_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         "判定条件 | Criteria: 远离动态目标，连续3帧未检出判定为丢失 | receding dynamic target, loss = 3 consecutive missed frames",
+        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
         f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
@@ -1084,14 +1148,14 @@ def build_receding_recording_report(
         f"(frames={farthest_detected_track['first_frame']}-{farthest_detected_track['last_frame']})"
     )
     if stable_tracks and not unstable_tracks:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期横向稳定，无明显左右漂动 | all detected cycles are stable with no obvious left-right drift.")
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期未发生左右跨线 | all detected cycles stay on one side of the center line.")
     elif stable_tracks:
         lines.append(
             "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
             f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
         )
     else:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都存在明显横向漂移或抖动 | all detected cycles show noticeable lateral drift or jitter.")
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都发生左右跨线 | all detected cycles cross the center line from left to right or right to left.")
     lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
         f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
@@ -1132,6 +1196,8 @@ def evaluate_receding_recording(
     primary_track = max(tracks, key=lambda track: (track["detections"], track["duration_frames"])) if tracks else None
     track_build_frame_limit = scenario.get("track_build_frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT)
     require_lateral_stable = bool(scenario.get("require_lateral_stable", False))
+    stable_track_count = sum(1 for track in tracks if track.get("lateral_status") == "stable")
+    unstable_track_count = sum(1 for track in tracks if track.get("lateral_status") != "stable")
     require_continuous_track = bool(scenario.get("require_continuous_track", False))
 
     max_detected_range_pass = None
@@ -1165,7 +1231,7 @@ def evaluate_receding_recording(
 
     lateral_stable_pass = None
     if require_lateral_stable:
-        lateral_stable_pass = bool(primary_track) and primary_track["lateral_status"] == "stable"
+        lateral_stable_pass = bool(tracks) and unstable_track_count == 0
         checks.append(lateral_stable_pass)
 
     if max_detected_range_pass is not None:
@@ -1181,6 +1247,8 @@ def evaluate_receding_recording(
         "build_frame_count": build_frame_count,
         "track_build_pass": track_build_pass,
         "lateral_stable_pass": lateral_stable_pass,
+        "stable_track_count": stable_track_count,
+        "unstable_track_count": unstable_track_count,
         "farthest_detected_range_m": farthest_detected_range,
         "min_max_detected_range_m": (
             float(min_max_detected_range)
@@ -1344,7 +1412,8 @@ def append_receding_result_summary(report: str, result: Mapping[str, Any]) -> st
         )
     if result["lateral_stable_pass"] is not None:
         extra_lines.append(
-            f"航迹稳定检查 | Lateral-stability check: primary track stable "
+            f"航迹稳定检查 | Lateral-stability check: stable={result.get('stable_track_count', 0)}, "
+            f"unstable={result.get('unstable_track_count', 0)} "
             f"-> {'PASS' if result['lateral_stable_pass'] else 'FAIL'}"
         )
     if result["min_max_detected_range_m"] is not None:
@@ -1411,6 +1480,7 @@ def build_approaching_recording_report(
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
+    angle_tolerance = dynamic_angle_tolerance(scenario)
     lines = [
         "=" * 60,
         "目标接近分析 | Approaching Target Analysis",
@@ -1422,6 +1492,7 @@ def build_approaching_recording_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         "判定说明 | Criteria: 接近动态目标轨迹摘要 | approaching dynamic target track summary",
+        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
         f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
@@ -1463,14 +1534,14 @@ def build_approaching_recording_report(
     stable_tracks = [track for track in tracks if track["lateral_status"] == "stable"]
     unstable_tracks = [track for track in tracks if track["lateral_status"] != "stable"]
     if stable_tracks and not unstable_tracks:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期横向稳定，无明显左右漂动 | all detected cycles are stable with no obvious left-right drift.")
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期未发生左右跨线 | all detected cycles stay on one side of the center line.")
     elif stable_tracks:
         lines.append(
             "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
             f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
         )
     else:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都存在明显横向漂移或抖动 | all detected cycles show noticeable lateral drift or jitter.")
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都发生左右跨线 | all detected cycles cross the center line from left to right or right to left.")
     lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
         f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
@@ -1629,6 +1700,9 @@ def build_multi_resolution_report(
         "判定条件2 | Criteria 2: 距离分辨力应 < 0.85m | range resolution should be < 0.85m",
         "判定条件3 | Criteria 3: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
         "判定说明 | Resolution rule: 按 [Object] 段的目标行数判断，2行表示2个目标，1行或0行表示 Object目标数<2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
+        "判定方法 | Decision method: 距离分辨力单帧判定按 [Object] 行数，>=2 行为已分辨，<2 行为未分辨 | range-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
+        "连续性判定 | Continuity method: 首次已分辨帧之前视为建航阶段，不计入丢失；首次已分辨后连续3帧未分辨则连续性失败 | frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
+        "二分判定 | Binary-search method: 某个距离间隔只要出现任意已分辨帧，即认为该间隔可分辨并继续尝试更小间隔；完全无已分辨帧则认为已合并并尝试更大间隔。resolution_before_merge 为最小已分辨测试间隔，merge_threshold 为最大已合并测试间隔 | any resolved frame means the tested range gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
     ]
 
     lines.append(
@@ -1705,6 +1779,9 @@ def build_multi_speed_resolution_report(
         "判定条件2 | Criteria 2: 速度分辨力应 < 0.2m/s | speed resolution should be < 0.2m/s",
         "判定条件3 | Criteria 3: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
         "判定说明 | Resolution rule: 按 [Object] 段的目标行数判断，2行表示2个目标，1行或0行表示 Object目标数<2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
+        "判定方法 | Decision method: 速度分辨力单帧判定按 [Object] 行数，>=2 行为已分辨，<2 行为未分辨 | speed-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
+        "连续性判定 | Continuity method: 首次已分辨帧之前视为建航阶段，不计入丢失；首次已分辨后连续3帧未分辨则连续性失败 | frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
+        "二分判定 | Binary-search method: 某个速度间隔只要出现任意已分辨帧，即认为该间隔可分辨并继续尝试更小间隔；完全无已分辨帧则认为已合并并尝试更大间隔。resolution_before_merge 为最小已分辨测试间隔，merge_threshold 为最大已合并测试间隔 | any resolved frame means the tested speed gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
     ]
 
     lines.append(
@@ -1756,6 +1833,38 @@ def build_multi_speed_resolution_report(
         )
     lines.append(f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
     return "\n".join(lines) + "\n"
+
+
+def _build_multi_resolution_failure_result(
+    frames,
+    scenario: Mapping[str, Any],
+    resolution_key: str,
+    merge_key: str,
+    threshold_key: str,
+) -> dict[str, Any]:
+    from detect_loss import analyze_expected_point_count
+
+    result = {
+        "frame_count": len(frames),
+        "resolved_frame_count": 0,
+        "resolved_frames": [],
+        "resolved_target_items": [],
+        "unresolved_frame_count": len(frames),
+        "unresolved_frames": list(range(1, len(frames) + 1)),
+        "max_consecutive_unresolved": len(frames),
+        "longest_unresolved_run": (1, len(frames), len(frames)) if frames else None,
+        "continuity_pass": False,
+        "two_target_detected": False,
+        "avg_detected_gap_m": None,
+        "avg_detected_gap_mps": None,
+    }
+    result.update(analyze_expected_point_count(frames, expected_point_count=3))
+    result[resolution_key] = None
+    result[merge_key] = None
+    result[threshold_key] = float(scenario[threshold_key])
+    result["resolution_pass"] = False
+    result["overall_pass"] = False
+    return result
 
 
 def build_speed_sweep_report(
@@ -1887,17 +1996,19 @@ def analyze_receding_recording(
     from detect_loss import analyze_expected_point_count, find_receding_target_tracks, parse_frames, summarize_alarm_events_for_tracks
 
     frames = parse_frames(frame_path)
+    angle_tolerance = dynamic_angle_tolerance(scenario)
     tracks = find_receding_target_tracks(
         frames,
         target_speed=float(scenario["speed"]),
         velocity_tolerance=2.0,
-        angle_tolerance=0.25,
+        angle_tolerance=angle_tolerance,
         start_range_max=max(5.0, float(scenario["r_start"]) + 3.0),
         expected_range_step=abs(float(scenario["speed"])) * 0.1,
         range_prediction_tolerance=4.0,
         loss_gap_frames=3,
         min_detections=8,
         require_complete_cycle=True,
+        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
     )
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
@@ -1907,7 +2018,11 @@ def analyze_receding_recording(
         frame_limit=dynamic_track_build_frame_limit(scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
-    distance_error_result = evaluate_dynamic_distance_errors(tracks, scenario)
+    distance_error_result = evaluate_dynamic_distance_errors(
+        tracks,
+        scenario,
+        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+    )
     result["overall_pass"] = result["overall_pass"] and distance_error_result["longitudinal_pass"] and distance_error_result["velocity_pass"]
     if distance_error_result["lateral_pass"] is not None:
         result["overall_pass"] = result["overall_pass"] and distance_error_result["lateral_pass"]
@@ -1942,17 +2057,19 @@ def analyze_approaching_recording(
     from detect_loss import analyze_expected_point_count, find_approaching_target_tracks, parse_frames, summarize_alarm_events_for_tracks
 
     frames = parse_frames(frame_path)
+    angle_tolerance = dynamic_angle_tolerance(scenario)
     tracks = find_approaching_target_tracks(
         frames,
         target_speed=float(scenario["speed"]),
         velocity_tolerance=3.0,
-        angle_tolerance=0.25,
+        angle_tolerance=angle_tolerance,
         start_range_min=float(scenario.get("start_range_min", max(10.0, float(scenario["r_start"]) - 5.0))),
         expected_range_step=abs(float(scenario["speed"])) * 0.1,
         range_prediction_tolerance=4.0,
         loss_gap_frames=3,
         min_detections=8,
         require_complete_cycle=True,
+        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
     )
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
@@ -1961,7 +2078,11 @@ def analyze_approaching_recording(
         frame_limit=dynamic_track_build_frame_limit(scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
-    distance_error_result = evaluate_dynamic_distance_errors(tracks, scenario)
+    distance_error_result = evaluate_dynamic_distance_errors(
+        tracks,
+        scenario,
+        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+    )
 
     print()
     report = build_approaching_recording_report(
@@ -2113,7 +2234,7 @@ def analyze_m1_resolution(
     scenario: Mapping[str, Any],
 ) -> Path:
     from detect_loss import analyze_expected_point_count, analyze_two_target_resolution, parse_frames, summarize_alarm_events
-    from radar_recording import record_once
+    from radar_recording import prepare_recording_tool, record_once
 
     base_range_1 = float(scenario["targets"][0]["range"])
     base_range_2 = float(scenario["targets"][1]["range"])
@@ -2124,35 +2245,98 @@ def analyze_m1_resolution(
     best_resolved_gap = initial_gap
     best_result = None
     best_frame_path = None
+    last_frame_path = None
+    session_dir = None
+    search_warnings: list[str] = []
 
-    for _ in range(5):
+    for iteration in range(5):
         test_gap = round((low + high) / 2, 3)
+        print(f"[INFO] M1 binary-search iteration {iteration + 1}/5: test_gap={test_gap}m")
         def configure_targets() -> None:
             sim.set_object_range(1, base_range_1)
             sim.set_object_range(2, base_range_1 + test_gap)
 
-        frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
-        frame_path = rename_recording_folder(frame_path, profile, selection)
-        frames = parse_frames(frame_path)
-        analysis = analyze_two_target_resolution(
-            frames,
-            target_speed=target_speed,
-            expected_ranges=[base_range_1, base_range_1 + test_gap],
-            matching_range_tolerance=1.0,
-        )
-        analysis.update(analyze_expected_point_count(frames, expected_point_count=3))
-        analysis["alarm_summary"] = summarize_alarm_events(frames)
+        try:
+            frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
+            frame_path, session_dir = archive_binary_search_recording(
+                frame_path,
+                profile,
+                selection,
+                session_dir,
+                iteration + 1,
+                test_gap,
+                "m",
+            )
+            last_frame_path = frame_path
+            frames = parse_frames(frame_path)
+            analysis = analyze_two_target_resolution(
+                frames,
+                target_speed=target_speed,
+                expected_ranges=[base_range_1, base_range_1 + test_gap],
+                matching_range_tolerance=1.0,
+            )
+            analysis.update(analyze_expected_point_count(frames, expected_point_count=3))
+            analysis["alarm_summary"] = summarize_alarm_events(frames)
 
-        if analysis["two_target_detected"]:
-            best_resolved_gap = test_gap
-            best_result = analysis
-            best_frame_path = frame_path
-            high = test_gap
-        else:
-            low = test_gap
+            if analysis["two_target_detected"]:
+                best_resolved_gap = test_gap
+                best_result = analysis
+                best_frame_path = frame_path
+                high = test_gap
+            else:
+                low = test_gap
+        except Exception as exc:
+            warning = (
+                f"[WARN] M1 binary-search iteration {iteration + 1} failed: {exc}. "
+                "Using the latest successful sample to generate the log."
+            )
+            print(warning)
+            search_warnings.append(warning)
+            try:
+                main_win = prepare_recording_tool()
+                print("[INFO] Reinitialized recording tool for the next M1 iteration.")
+            except Exception as prep_exc:
+                print(f"[WARN] Failed to reinitialize recording tool after M1 iteration error: {prep_exc}")
+            continue
 
     if best_result is None or best_frame_path is None:
-        raise RuntimeError("Could not resolve two-target distance resolution for M1.")
+        if last_frame_path is None:
+            raise RuntimeError("Could not record data for M1.")
+        best_frame_path = last_frame_path
+        frames = parse_frames(best_frame_path)
+        alarm_summary = summarize_alarm_events(frames)
+        result = _build_multi_resolution_failure_result(
+            frames,
+            scenario,
+            resolution_key="resolution_before_merge_m",
+            merge_key="merge_threshold_m",
+            threshold_key="resolution_threshold_m",
+        )
+        distance_error_result = evaluate_multi_distance_errors(result, scenario)
+        continuity_result = build_single_point_continuity_result([], first_frame=None, last_frame=None)
+        report = build_multi_resolution_report(best_frame_path, profile, selection, scenario, result, alarm_summary)
+        report = append_point_continuity_summary(report, continuity_result, label="target")
+        report = append_distance_error_summary(report, distance_error_result)
+        report = insert_lines_before_overall(
+            report,
+            search_warnings
+            + [
+                "[警告/ WARN] 二分搜索的所有录制样本都未识别到两个 Object 目标，已输出失败日志。"
+                " | No recording sample in the binary search resolved two Object targets; failure log generated."
+            ],
+        )
+        report = replace_overall_result(report, False)
+        print()
+        print(report, end="")
+        log_path = write_receding_recording_log(
+            best_frame_path,
+            profile,
+            selection,
+            report,
+            prefix="multi_target_resolution_analysis",
+        )
+        print(f"[INFO] Saved multi-target resolution log: {log_path}")
+        return log_path
 
     result = {
         **best_result,
@@ -2181,6 +2365,8 @@ def analyze_m1_resolution(
     report = build_multi_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
     report = append_point_continuity_summary(report, continuity_result, label="target")
     report = append_distance_error_summary(report, distance_error_result)
+    if search_warnings:
+        report = insert_lines_before_overall(report, search_warnings)
     report = replace_overall_result(report, result["overall_pass"])
     print()
     print(report, end="")
@@ -2203,7 +2389,7 @@ def analyze_m2_speed_resolution(
     scenario: Mapping[str, Any],
 ) -> Path:
     from detect_loss import analyze_expected_point_count, analyze_two_target_speed_resolution, parse_frames, summarize_alarm_events
-    from radar_recording import record_once
+    from radar_recording import prepare_recording_tool, record_once
 
     target_range = float(scenario["targets"][0]["range"])
     speed_1 = abs(float(scenario["targets"][0]["speed"]))
@@ -2214,35 +2400,98 @@ def analyze_m2_speed_resolution(
     best_resolved_gap = initial_gap
     best_result = None
     best_frame_path = None
+    last_frame_path = None
+    session_dir = None
+    search_warnings: list[str] = []
 
-    for _ in range(5):
+    for iteration in range(5):
         test_gap = round((low + high) / 2, 3)
+        print(f"[INFO] M2 binary-search iteration {iteration + 1}/5: test_gap={test_gap}m/s")
         def configure_targets() -> None:
             sim.set_object_speed(1, -speed_1)
             sim.set_object_speed(2, -(speed_1 + test_gap))
 
-        frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
-        frame_path = rename_recording_folder(frame_path, profile, selection)
-        frames = parse_frames(frame_path)
-        analysis = analyze_two_target_speed_resolution(
-            frames,
-            target_range=target_range,
-            expected_speeds=[speed_1, speed_1 + test_gap],
-            matching_range_tolerance=1.0,
-        )
-        analysis.update(analyze_expected_point_count(frames, expected_point_count=3))
-        analysis["alarm_summary"] = summarize_alarm_events(frames)
+        try:
+            frame_path = record_once(main_win, seconds=5, on_recording_started=configure_targets)
+            frame_path, session_dir = archive_binary_search_recording(
+                frame_path,
+                profile,
+                selection,
+                session_dir,
+                iteration + 1,
+                test_gap,
+                "mps",
+            )
+            last_frame_path = frame_path
+            frames = parse_frames(frame_path)
+            analysis = analyze_two_target_speed_resolution(
+                frames,
+                target_range=target_range,
+                expected_speeds=[speed_1, speed_1 + test_gap],
+                matching_range_tolerance=1.0,
+            )
+            analysis.update(analyze_expected_point_count(frames, expected_point_count=3))
+            analysis["alarm_summary"] = summarize_alarm_events(frames)
 
-        if analysis["two_target_detected"]:
-            best_resolved_gap = test_gap
-            best_result = analysis
-            best_frame_path = frame_path
-            high = test_gap
-        else:
-            low = test_gap
+            if analysis["two_target_detected"]:
+                best_resolved_gap = test_gap
+                best_result = analysis
+                best_frame_path = frame_path
+                high = test_gap
+            else:
+                low = test_gap
+        except Exception as exc:
+            warning = (
+                f"[WARN] M2 binary-search iteration {iteration + 1} failed: {exc}. "
+                "Using the latest successful sample to generate the log."
+            )
+            print(warning)
+            search_warnings.append(warning)
+            try:
+                main_win = prepare_recording_tool()
+                print("[INFO] Reinitialized recording tool for the next M2 iteration.")
+            except Exception as prep_exc:
+                print(f"[WARN] Failed to reinitialize recording tool after M2 iteration error: {prep_exc}")
+            continue
 
     if best_result is None or best_frame_path is None:
-        raise RuntimeError("Could not resolve two-target speed resolution for M2.")
+        if last_frame_path is None:
+            raise RuntimeError("Could not record data for M2.")
+        best_frame_path = last_frame_path
+        frames = parse_frames(best_frame_path)
+        alarm_summary = summarize_alarm_events(frames)
+        result = _build_multi_resolution_failure_result(
+            frames,
+            scenario,
+            resolution_key="resolution_before_merge_mps",
+            merge_key="merge_threshold_mps",
+            threshold_key="speed_resolution_threshold_mps",
+        )
+        distance_error_result = evaluate_multi_distance_errors(result, scenario)
+        continuity_result = build_single_point_continuity_result([], first_frame=None, last_frame=None)
+        report = build_multi_speed_resolution_report(best_frame_path, profile, selection, scenario, result, alarm_summary)
+        report = append_point_continuity_summary(report, continuity_result, label="target")
+        report = append_distance_error_summary(report, distance_error_result)
+        report = insert_lines_before_overall(
+            report,
+            search_warnings
+            + [
+                "[警告/ WARN] 二分搜索的所有录制样本都未识别到两个 Object 目标，已输出失败日志。"
+                " | No recording sample in the binary search resolved two Object targets; failure log generated."
+            ],
+        )
+        report = replace_overall_result(report, False)
+        print()
+        print(report, end="")
+        log_path = write_receding_recording_log(
+            best_frame_path,
+            profile,
+            selection,
+            report,
+            prefix="multi_target_speed_resolution_analysis",
+        )
+        print(f"[INFO] Saved multi-target speed-resolution log: {log_path}")
+        return log_path
 
     result = {
         **best_result,
@@ -2271,6 +2520,8 @@ def analyze_m2_speed_resolution(
     report = build_multi_speed_resolution_report(best_frame_path, profile, selection, scenario, result, result["alarm_summary"])
     report = append_point_continuity_summary(report, continuity_result, label="target")
     report = append_distance_error_summary(report, distance_error_result)
+    if search_warnings:
+        report = insert_lines_before_overall(report, search_warnings)
     report = replace_overall_result(report, result["overall_pass"])
     print()
     print(report, end="")

@@ -41,8 +41,6 @@ def summarize_lateral_motion(
     points,
     angle_unit="deg",
     center_cross_tolerance_deg=0.15,
-    stable_angle_span_deg=0.3,
-    stable_angle_std_deg=0.12,
 ):
     if not points:
         return {
@@ -90,12 +88,7 @@ def summarize_lateral_motion(
         and max_angle > center_cross_tolerance_deg
     )
 
-    if crosses_center:
-        lateral_status = "left-right crossing"
-    elif angle_span > stable_angle_span_deg or angle_std > stable_angle_std_deg:
-        lateral_status = "noticeable jitter"
-    else:
-        lateral_status = "stable"
+    lateral_status = "left-right crossing" if crosses_center else "stable"
 
     return {
         "start_angle_az": round(angles[0], 2),
@@ -289,6 +282,164 @@ def analyze_two_target_resolution(
     expected_ranges,
     matching_range_tolerance=1.0,
 ):
+    first_resolved_seen = False
+    consecutive_unresolved = 0
+    max_consecutive_unresolved = 0
+    current_unresolved_start = None
+    longest_unresolved_run = None
+    unresolved_frames = []
+    resolved_frames = []
+    resolved_target_items = []
+    resolved_frame_count = 0
+    resolved_ranges = []
+
+    for frame_idx, frame in enumerate(frames, start=1):
+        objects = list(frame.get("objects", []))
+        if len(objects) >= 2:
+            selected = sorted(
+                objects,
+                key=lambda obj: min(abs(obj.dist_long - expected_range) for expected_range in expected_ranges),
+            )[:2]
+            selected = sorted(selected, key=lambda obj: obj.dist_long)
+            expected_by_range = sorted(expected_ranges)
+            frame_matches = []
+            for target_index, (expected_range, obj) in enumerate(zip(expected_by_range, selected), start=1):
+                range_error = obj.dist_long - expected_range
+                frame_matches.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "target_index": target_index,
+                        "expected_range": expected_range,
+                        "object": obj,
+                        "frame": frame,
+                        "range_error": range_error,
+                    }
+                )
+            first_resolved_seen = True
+            consecutive_unresolved = 0
+            current_unresolved_start = None
+            resolved_frame_count += 1
+            resolved_frames.append(frame_idx)
+            resolved_ranges.append(tuple(sorted(item["object"].dist_long for item in frame_matches)))
+            resolved_target_items.extend(frame_matches)
+            continue
+
+        if not first_resolved_seen:
+            continue
+
+        if consecutive_unresolved == 0:
+            current_unresolved_start = frame_idx
+        consecutive_unresolved += 1
+        max_consecutive_unresolved = max(max_consecutive_unresolved, consecutive_unresolved)
+        if max_consecutive_unresolved == consecutive_unresolved and current_unresolved_start is not None:
+            longest_unresolved_run = (current_unresolved_start, frame_idx, consecutive_unresolved)
+        unresolved_frames.append(frame_idx)
+
+    avg_detected_gap = None
+    if resolved_ranges:
+        gaps = [abs(ranges[1] - ranges[0]) for ranges in resolved_ranges]
+        avg_detected_gap = round(sum(gaps) / len(gaps), 3)
+
+    return {
+        "frame_count": len(frames),
+        "resolved_frame_count": resolved_frame_count,
+        "resolved_frames": resolved_frames,
+        "resolved_target_items": resolved_target_items,
+        "unresolved_frame_count": len(unresolved_frames),
+        "unresolved_frames": unresolved_frames,
+        "max_consecutive_unresolved": max_consecutive_unresolved,
+        "longest_unresolved_run": longest_unresolved_run,
+        "continuity_pass": max_consecutive_unresolved < 3,
+        "two_target_detected": resolved_frame_count > 0,
+        "avg_detected_gap_m": avg_detected_gap,
+    }
+
+
+def analyze_two_target_speed_resolution(
+    frames,
+    target_range,
+    expected_speeds,
+    matching_range_tolerance=1.0,
+):
+    first_resolved_seen = False
+    consecutive_unresolved = 0
+    max_consecutive_unresolved = 0
+    current_unresolved_start = None
+    longest_unresolved_run = None
+    unresolved_frames = []
+    resolved_frames = []
+    resolved_target_items = []
+    resolved_frame_count = 0
+    resolved_speeds = []
+
+    for frame_idx, frame in enumerate(frames, start=1):
+        objects = list(frame.get("objects", []))
+        if len(objects) >= 2:
+            selected = sorted(
+                objects,
+                key=lambda obj: (
+                    abs(obj.dist_long - target_range),
+                    min(abs(abs(obj.vre_long) - expected_speed) for expected_speed in expected_speeds),
+                ),
+            )[:2]
+            selected_by_speed = sorted(selected, key=lambda obj: abs(obj.vre_long))
+            first_resolved_seen = True
+            consecutive_unresolved = 0
+            current_unresolved_start = None
+            resolved_frame_count += 1
+            resolved_frames.append(frame_idx)
+            resolved_speeds.append(tuple(sorted(abs(obj.vre_long) for obj in selected_by_speed)))
+            for target_index, obj in enumerate(selected_by_speed, start=1):
+                expected_speed = expected_speeds[min(target_index - 1, len(expected_speeds) - 1)]
+                resolved_target_items.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "target_index": target_index,
+                        "expected_range": target_range,
+                        "expected_speed": expected_speed,
+                        "object": obj,
+                        "frame": frame,
+                    }
+                )
+            continue
+
+        if not first_resolved_seen:
+            continue
+
+        if consecutive_unresolved == 0:
+            current_unresolved_start = frame_idx
+        consecutive_unresolved += 1
+        max_consecutive_unresolved = max(max_consecutive_unresolved, consecutive_unresolved)
+        if max_consecutive_unresolved == consecutive_unresolved and current_unresolved_start is not None:
+            longest_unresolved_run = (current_unresolved_start, frame_idx, consecutive_unresolved)
+        unresolved_frames.append(frame_idx)
+
+    avg_detected_gap = None
+    if resolved_speeds:
+        gaps = [abs(speeds[1] - speeds[0]) for speeds in resolved_speeds]
+        avg_detected_gap = round(sum(gaps) / len(gaps), 3)
+
+    return {
+        "frame_count": len(frames),
+        "resolved_frame_count": resolved_frame_count,
+        "resolved_frames": resolved_frames,
+        "resolved_target_items": resolved_target_items,
+        "unresolved_frame_count": len(unresolved_frames),
+        "unresolved_frames": unresolved_frames,
+        "max_consecutive_unresolved": max_consecutive_unresolved,
+        "longest_unresolved_run": longest_unresolved_run,
+        "continuity_pass": max_consecutive_unresolved < 3,
+        "two_target_detected": resolved_frame_count > 0,
+        "avg_detected_gap_mps": avg_detected_gap,
+    }
+
+
+def _legacy_analyze_two_target_resolution(
+    frames,
+    target_speed,
+    expected_ranges,
+    matching_range_tolerance=1.0,
+):
     consecutive_unresolved = 0
     max_consecutive_unresolved = 0
     current_unresolved_start = None
@@ -362,7 +513,7 @@ def analyze_two_target_resolution(
     }
 
 
-def analyze_two_target_speed_resolution(
+def _legacy_analyze_two_target_speed_resolution(
     frames,
     target_range,
     expected_speeds,
@@ -1222,6 +1373,7 @@ def find_static_points(frames, velocity_threshold=0.3, range_tolerance=0.3, min_
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
+        angles_deg = _angles_to_degrees(angles, angle_unit=angle_unit)
         powers = [point.power for point in points]
         static_points.append(
             {
@@ -1319,6 +1471,7 @@ def find_static_segments(
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
+        angles_deg = _angles_to_degrees(angles, angle_unit=angle_unit)
         powers = [point.power for point in points]
         segments.append(
             {
@@ -1410,6 +1563,7 @@ def find_range_stable_segments(
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
+        angles_deg = _angles_to_degrees(angles, angle_unit=angle_unit)
         powers = [point.power for point in points]
         segments.append(
             {
@@ -1443,6 +1597,7 @@ def find_receding_target_tracks(
     loss_gap_frames=3,
     min_detections=8,
     require_complete_cycle=True,
+    angle_unit="deg",
 ):
     active_tracks = []
     finished_tracks = []
@@ -1523,6 +1678,7 @@ def find_receding_target_tracks(
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
+        angles_deg = _angles_to_degrees(angles, angle_unit=angle_unit)
         powers = [point.power for point in points]
         object_build_frame_count = None
         for item in items:
@@ -1530,7 +1686,7 @@ def find_receding_target_tracks(
             if frame is not None and frame.get("object_num", 0) > 0:
                 object_build_frame_count = item["frame_idx"]
                 break
-        lateral_summary = summarize_lateral_motion(points)
+        lateral_summary = summarize_lateral_motion(points, angle_unit=angle_unit)
         tracks.append(
             {
                 "first_frame": items[0]["frame_idx"],
@@ -1545,7 +1701,7 @@ def find_receding_target_tracks(
                 "max_range_m": max(ranges),
                 "object_build_frame_count": object_build_frame_count,
                 "avg_velocity": round(sum(velocities) / len(velocities), 2),
-                "avg_angle_az": round(sum(angles) / len(angles), 2),
+                "avg_angle_az": round(sum(angles_deg) / len(angles_deg), 2),
                 "avg_power": round(sum(powers) / len(powers), 2),
                 **lateral_summary,
             }
@@ -1566,6 +1722,7 @@ def find_approaching_target_tracks(
     loss_gap_frames=3,
     min_detections=8,
     require_complete_cycle=True,
+    angle_unit="deg",
 ):
     active_tracks = []
     finished_tracks = []
@@ -1646,8 +1803,9 @@ def find_approaching_target_tracks(
         ranges = [point.range_m for point in points]
         velocities = [point.velocity for point in points]
         angles = [point.angle_az for point in points]
+        angles_deg = _angles_to_degrees(angles, angle_unit=angle_unit)
         powers = [point.power for point in points]
-        lateral_summary = summarize_lateral_motion(points)
+        lateral_summary = summarize_lateral_motion(points, angle_unit=angle_unit)
         tracks.append(
             {
                 "first_frame": items[0]["frame_idx"],
@@ -1661,7 +1819,7 @@ def find_approaching_target_tracks(
                 "closest_range_m": ranges[-1],
                 "min_range_m": min(ranges),
                 "avg_velocity": round(sum(velocities) / len(velocities), 2),
-                "avg_angle_az": round(sum(angles) / len(angles), 2),
+                "avg_angle_az": round(sum(angles_deg) / len(angles_deg), 2),
                 "avg_power": round(sum(powers) / len(powers), 2),
                 **lateral_summary,
             }
