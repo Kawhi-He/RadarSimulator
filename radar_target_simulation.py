@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 """Unified entry point for Xiaoniu and Aima radar target simulation."""
 
 from __future__ import annotations
@@ -24,6 +24,10 @@ LATERAL_STABILITY_CRITERIA = (
     "if min_angle < -0.15deg and max_angle > 0.15deg -> left-right crossing; "
     "otherwise -> stable. Angle span/std and lateral span are reported for reference only."
 )
+
+
+def console_safe_text(text: str) -> str:
+    return text.encode("gbk", errors="replace").decode("gbk")
 
 
 def choose_profile(default: str | None = None) -> BrandProfile:
@@ -777,9 +781,253 @@ def append_point_continuity_summary(
     label: str = "cycle",
 ) -> str:
     extra_lines = [
+        f"鐐逛簯杩炵画鎬ф€荤粨鏋?| Point-cloud continuity overall: target point appears continuously with no interruption "
+        f"-> {'PASS' if result.get('continuous_pass') else 'FAIL'}",
+        f"杩炵画3甯т涪澶辨鏌ユ€荤粨鏋?| 3-frame loss overall: no internal 3 consecutive missed frames after target appears "
+        f"-> {'PASS' if result.get('no_three_frame_loss_pass') else 'FAIL'}",
+    ]
+    cycle_results = result.get("cycle_results", [])
+    if not cycle_results:
+        extra_lines.append("鐐逛簯杩炵画鎬ф槑缁?| Point-cloud continuity details: no matched target point.")
+    for cycle in cycle_results:
+        missing_frames = cycle.get("missing_frames", [])
+        missing_sample = ", ".join(str(frame) for frame in missing_frames[:10]) if missing_frames else "none"
+        extra_lines.append(
+            f"鐐逛簯杩炵画鎬ф槑缁?| Point-cloud continuity {label} #{cycle['cycle_index']}: "
+            f"frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"matched_frames={cycle.get('matched_frame_count')}, "
+            f"missing_frames={len(missing_frames)}, "
+            f"max_consecutive_missing={cycle.get('max_consecutive_missing')}, "
+            f"missing_sample={missing_sample}, "
+            f"continuous={'PASS' if cycle.get('continuous_pass') else 'FAIL'}, "
+            f"no_3_frame_loss={'PASS' if cycle.get('no_three_frame_loss_pass') else 'FAIL'}"
+        )
+    return insert_lines_before_overall(report, extra_lines)
+
+
+def append_distance_error_summary(report: str, result: Mapping[str, Any]) -> str:
+    sample_count = result.get("sample_count", 0)
+    long_tolerance = result.get("longitudinal_tolerance_m")
+    lateral_tolerance = result.get("lateral_tolerance_m")
+    velocity_tolerance = result.get("velocity_tolerance_mps")
+    max_longitudinal_sample = result.get("max_longitudinal_error_sample") or {}
+    max_lateral_sample = result.get("max_lateral_error_sample") or {}
+    max_velocity_sample = result.get("max_velocity_error_sample") or {}
+    max_angle_sample = result.get("max_angle_error_sample") or {}
+    extra_lines = [
+        f"绾靛悜璺濈璇樊妫€鏌?| Longitudinal distance error check (+/-{long_tolerance}m): "
+        f"samples={sample_count}, "
+        f"max_abs_error={result.get('max_abs_longitudinal_error_m')}m, "
+        f"avg_abs_error={result.get('avg_abs_longitudinal_error_m')}m, "
+        f"error_range={result.get('min_longitudinal_error_m')}~{result.get('max_longitudinal_error_m')}m "
+        f"-> {'PASS' if result.get('longitudinal_pass') else 'FAIL'}"
+    ]
+    if max_longitudinal_sample:
+        cycle_text = (
+            f", cycle={max_longitudinal_sample['cycle_index']}"
+            if max_longitudinal_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_longitudinal_sample['target_index']}"
+            if max_longitudinal_sample.get("target_index") is not None
+            else ""
+        )
+        longitudinal_error = float(max_longitudinal_sample.get("longitudinal_error_m", 0.0))
+        extra_lines.append(
+            "鏈€澶х旱鍚戣宸綅缃?| Max longitudinal error detail: "
+            f"frame={max_longitudinal_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_longitudinal_sample.get('source')}, "
+            f"actual={max_longitudinal_sample.get('actual_longitudinal_m')}m, "
+            f"expected={max_longitudinal_sample.get('expected_longitudinal_m')}m, "
+            f"calculation={max_longitudinal_sample.get('actual_longitudinal_m')} - "
+            f"{max_longitudinal_sample.get('expected_longitudinal_m')} = "
+            f"{max_longitudinal_sample.get('longitudinal_error_m')}m, "
+            f"abs_error={abs(longitudinal_error):.3f}m"
+        )
+    if lateral_tolerance is None:
+        extra_lines.append(
+            "妯悜璺濈璇樊璁板綍 | Lateral distance error record: "
+            f"samples={sample_count}, "
+            f"max_abs_error={result.get('max_abs_lateral_error_m')}m, "
+            f"avg_abs_error={result.get('avg_abs_lateral_error_m')}m, "
+            f"error_range={result.get('min_lateral_error_m')}~{result.get('max_lateral_error_m')}m, "
+            "tolerance=not configured -> RECORDED"
+        )
+    else:
+        extra_lines.append(
+            f"妯悜璺濈璇樊妫€鏌?| Lateral distance error check (+/-{lateral_tolerance}m): "
+            f"samples={sample_count}, "
+            f"max_abs_error={result.get('max_abs_lateral_error_m')}m, "
+            f"avg_abs_error={result.get('avg_abs_lateral_error_m')}m, "
+            f"error_range={result.get('min_lateral_error_m')}~{result.get('max_lateral_error_m')}m "
+            f"-> {'PASS' if result.get('lateral_pass') else 'FAIL'}"
+        )
+    if max_lateral_sample:
+        cycle_text = (
+            f", cycle={max_lateral_sample['cycle_index']}"
+            if max_lateral_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_lateral_sample['target_index']}"
+            if max_lateral_sample.get("target_index") is not None
+            else ""
+        )
+        lateral_error = float(max_lateral_sample.get("lateral_error_m", 0.0))
+        extra_lines.append(
+            "鏈€澶фí鍚戣宸綅缃?| Max lateral error detail: "
+            f"frame={max_lateral_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_lateral_sample.get('source')}, "
+            f"actual={max_lateral_sample.get('actual_lateral_m')}m, "
+            f"expected={max_lateral_sample.get('expected_lateral_m')}m, "
+            f"calculation={max_lateral_sample.get('actual_lateral_m')} - "
+            f"{max_lateral_sample.get('expected_lateral_m')} = "
+            f"{max_lateral_sample.get('lateral_error_m')}m, "
+            f"abs_error={abs(lateral_error):.3f}m"
+        )
+    extra_lines.append(
+        f"閫熷害璇樊妫€鏌?| Velocity error check (+/-{velocity_tolerance}m/s): "
+        f"samples={sample_count}, "
+        f"max_abs_error={result.get('max_abs_velocity_error_mps')}m/s, "
+        f"avg_abs_error={result.get('avg_abs_velocity_error_mps')}m/s, "
+        f"error_range={result.get('min_velocity_error_mps')}~{result.get('max_velocity_error_mps')}m/s "
+        f"-> {'PASS' if result.get('velocity_pass') else 'FAIL'}"
+    )
+    if max_velocity_sample:
+        cycle_text = (
+            f", cycle={max_velocity_sample['cycle_index']}"
+            if max_velocity_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_velocity_sample['target_index']}"
+            if max_velocity_sample.get("target_index") is not None
+            else ""
+        )
+        velocity_error = float(max_velocity_sample.get("velocity_error_mps", 0.0))
+        extra_lines.append(
+            "鏈€澶ч€熷害璇樊浣嶇疆 | Max velocity error detail: "
+            f"frame={max_velocity_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_velocity_sample.get('source')}, "
+            f"actual={max_velocity_sample.get('actual_velocity_mps')}m/s, "
+            f"expected={max_velocity_sample.get('expected_velocity_mps')}m/s, "
+            f"calculation={max_velocity_sample.get('actual_velocity_mps')} - "
+            f"{max_velocity_sample.get('expected_velocity_mps')} = "
+            f"{max_velocity_sample.get('velocity_error_mps')}m/s, "
+            f"abs_error={abs(velocity_error):.3f}m/s"
+        )
+    extra_lines.append(
+        "瑙掑害鍋忓樊浼拌 | Angle bias estimate: "
+        f"samples={sample_count}, "
+        f"avg_bias={result.get('avg_angle_bias_deg')}deg, "
+        f"max_abs_error={result.get('max_abs_angle_error_deg')}deg, "
+        f"avg_abs_error={result.get('avg_abs_angle_error_deg')}deg, "
+        f"error_range={result.get('min_angle_error_deg')}~{result.get('max_angle_error_deg')}deg"
+    )
+    if max_angle_sample:
+        cycle_text = (
+            f", cycle={max_angle_sample['cycle_index']}"
+            if max_angle_sample.get("cycle_index") is not None
+            else ""
+        )
+        target_text = (
+            f", target={max_angle_sample['target_index']}"
+            if max_angle_sample.get("target_index") is not None
+            else ""
+        )
+        angle_error = float(max_angle_sample.get("angle_error_deg", 0.0))
+        extra_lines.append(
+            "鏈€澶ц搴﹀亸宸綅缃?| Max angle bias detail: "
+            f"frame={max_angle_sample.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={max_angle_sample.get('source')}, "
+            f"actual={max_angle_sample.get('actual_angle_deg')}deg, "
+            f"expected={max_angle_sample.get('expected_angle_deg')}deg, "
+            f"calculation={max_angle_sample.get('actual_angle_deg')} - "
+            f"{max_angle_sample.get('expected_angle_deg')} = "
+            f"{max_angle_sample.get('angle_error_deg')}deg, "
+            f"abs_error={abs(angle_error):.3f}deg"
+        )
+    if result.get("expected_model"):
+        extra_lines.append(f"璺濈璇樊鍒ゅ畾閫昏緫 | Distance error model: {result['expected_model']}")
+    for detail in result.get("details", [])[:5]:
+        cycle_text = f", cycle={detail['cycle_index']}" if detail.get("cycle_index") is not None else ""
+        target_text = f", target={detail['target_index']}" if detail.get("target_index") is not None else ""
+        extra_lines.append(
+            "璺濈璇樊鏍蜂緥 | Distance error sample: "
+            f"frame={detail.get('frame_idx')}{cycle_text}{target_text}, "
+            f"source={detail.get('source')}, "
+            f"longitudinal actual/expected/error="
+            f"{detail.get('actual_longitudinal_m')}/{detail.get('expected_longitudinal_m')}/{detail.get('longitudinal_error_m')}m, "
+            f"lateral actual/expected/error="
+            f"{detail.get('actual_lateral_m')}/{detail.get('expected_lateral_m')}/{detail.get('lateral_error_m')}m"
+        )
+    return insert_lines_before_overall(report, extra_lines)
+
+
+def append_dynamic_track_build_summary(report: str, result: Mapping[str, Any]) -> str:
+    extra_lines: list[str] = []
+    cycle_results = result.get("cycle_results", [])
+    frame_limit = result.get("frame_limit", DEFAULT_TRACK_BUILD_FRAME_LIMIT)
+    extra_lines.append(
+        f"建航时间总结果 | Track-build overall: all dynamic cycles build object within <= {frame_limit} frame(s) "
+        f"-> {'PASS' if result.get('track_build_pass') else 'FAIL'}"
+    )
+    if not cycle_results:
+        extra_lines.append("建航时间明细 | Track-build details: no matched dynamic target cycle.")
+    for cycle in cycle_results:
+        build_count = cycle.get("build_frame_count")
+        build_count_text = f"{build_count} frame(s)" if build_count is not None else "N/A"
+        object_summary = cycle.get("object_summary") or {}
+        extra_lines.append(
+            f"建航时间明细 | Track-build cycle #{cycle['cycle_index']}: "
+            f"point_first_frame={object_summary.get('first_point_frame')}, "
+            f"object_build_frame={object_summary.get('object_build_frame')}, "
+            f"build_time={build_count_text}, "
+            f"limit={frame_limit} "
+            f"-> {'PASS' if cycle.get('build_pass') else 'FAIL'}"
+        )
+    return insert_lines_before_overall(report, extra_lines)
+
+
+def append_approaching_complete_cycle_summary(report: str, result: Mapping[str, Any]) -> str:
+    build_distance = result.get("object_build_farthest_distance_m")
+    disappear_distance = result.get("object_disappear_nearest_distance_m")
+    complete_count = result.get("complete_cycle_count", 0)
+    build_text = f"{build_distance}m" if build_distance is not None else "N/A"
+    disappear_text = f"{disappear_distance}m" if disappear_distance is not None else "N/A"
+    extra_lines = [
+        f"完整周期目标距离汇总 | Complete-cycle object distance summary: complete_cycles={complete_count}, "
+        f"object_build_farthest_distance={build_text}, "
+        f"object_disappear_nearest_distance={disappear_text}"
+    ]
+    for cycle in result.get("cycle_results", []):
+        if not cycle.get("complete_cycle"):
+            continue
+        object_summary = cycle.get("object_summary") or {}
+        build_cycle_distance = object_summary.get("object_build_distance_m")
+        disappear_cycle_distance = object_summary.get("object_last_distance_m")
+        build_cycle_text = f"{build_cycle_distance}m" if build_cycle_distance is not None else "N/A"
+        disappear_cycle_text = f"{disappear_cycle_distance}m" if disappear_cycle_distance is not None else "N/A"
+        extra_lines.append(
+            f"完整周期目标距离明细 | Complete-cycle object distance cycle #{cycle['cycle_index']}: "
+            f"frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"loss_frame={cycle.get('loss_frame')}, "
+            f"object_build_distance={build_cycle_text}, "
+            f"object_disappear_distance={disappear_cycle_text}"
+        )
+    return report.rstrip("\n") + "\n" + "\n".join(extra_lines) + "\n"
+
+
+def append_point_continuity_summary(
+    report: str,
+    result: Mapping[str, Any],
+    label: str = "cycle",
+) -> str:
+    extra_lines = [
         f"点云连续性总结果 | Point-cloud continuity overall: target point appears continuously with no interruption "
         f"-> {'PASS' if result.get('continuous_pass') else 'FAIL'}",
-        f"连续3帧丢失检查总结果 | 3-frame loss overall: no internal 3 consecutive missed frames after target appears "
+        f"连续3帧丢失总结果 | 3-frame loss overall: no internal 3 consecutive missed frames after target appears "
         f"-> {'PASS' if result.get('no_three_frame_loss_pass') else 'FAIL'}",
     ]
     cycle_results = result.get("cycle_results", [])
@@ -914,7 +1162,7 @@ def append_distance_error_summary(report: str, result: Mapping[str, Any]) -> str
             f"abs_error={abs(velocity_error):.3f}m/s"
         )
     extra_lines.append(
-        "角度偏差估计 | Angle bias estimate: "
+        f"角度偏差估计 | Angle bias estimate: "
         f"samples={sample_count}, "
         f"avg_bias={result.get('avg_angle_bias_deg')}deg, "
         f"max_abs_error={result.get('max_abs_angle_error_deg')}deg, "
@@ -1095,27 +1343,27 @@ def build_receding_recording_report(
     angle_tolerance = dynamic_angle_tolerance(scenario)
     lines = [
         "=" * 60,
-        "目标远离丢失分析 | Receding Target Loss Analysis",
+        "鐩爣杩滅涓㈠け鍒嗘瀽 | Receding Target Loss Analysis",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        "判定条件 | Criteria: 远离动态目标，连续3帧未检出判定为丢失 | receding dynamic target, loss = 3 consecutive missed frames",
-        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
-        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
-        "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "鍒ゅ畾鏉′欢 | Criteria: 杩滅鍔ㄦ€佺洰鏍囷紝杩炵画3甯ф湭妫€鍑哄垽瀹氫负涓㈠け | receding dynamic target, loss = 3 consecutive missed frames",
+        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"寤鸿埅鏃堕棿妫€鏌?| Track-build check: 鐐逛簯棣栨鍑虹幇鍚?{track_build_frame_limit} 甯у唴搴旂敓鎴?object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
+        "鐐逛簯鏁伴噺妫€鏌?| Point-count check: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
     ]
 
     if not tracks:
-        lines.append("[警告/ WARN] 未找到符合条件的远离目标周期 | No receding target cycles found.")
+        lines.append("[璀﹀憡/ WARN] 鏈壘鍒扮鍚堟潯浠剁殑杩滅鐩爣鍛ㄦ湡 | No receding target cycles found.")
         return "\n".join(lines) + "\n"
 
     for idx, track in enumerate(tracks, 1):
         lines.append(
-            f"  周期#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
+            f"  鍛ㄦ湡#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
             f"(loss_frame={track['loss_frame']}), "
             f"detections={track['detections']}, "
             f"start_range={track['start_range_m']}m, "
@@ -1136,42 +1384,42 @@ def build_receding_recording_report(
     stable_tracks = [track for track in tracks if track["lateral_status"] == "stable"]
     unstable_tracks = [track for track in tracks if track["lateral_status"] != "stable"]
 
-    lines.append("各周期丢失距离 | Loss distance per cycle: " + ", ".join(f"{distance}m" for distance in loss_distances))
+    lines.append("鍚勫懆鏈熶涪澶辫窛绂?| Loss distance per cycle: " + ", ".join(f"{distance}m" for distance in loss_distances))
     lines.append(
-        "最远丢失距离 | Farthest loss distance across cycles: "
+        "鏈€杩滀涪澶辫窛绂?| Farthest loss distance across cycles: "
         f"{max(loss_distances)}m "
         f"(frames={farthest_loss_track['first_frame']}-{farthest_loss_track['last_frame']})"
     )
     lines.append(
-        "最远检出距离 | Farthest detected range across cycles: "
+        "鏈€杩滄鍑鸿窛绂?| Farthest detected range across cycles: "
         f"{max(max_detected_ranges)}m "
         f"(frames={farthest_detected_track['first_frame']}-{farthest_detected_track['last_frame']})"
     )
     if stable_tracks and not unstable_tracks:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期未发生左右跨线 | all detected cycles stay on one side of the center line.")
+        lines.append("妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 鎵€鏈夊懆鏈熸湭鍙戠敓宸﹀彸璺ㄧ嚎 | all detected cycles stay on one side of the center line.")
     elif stable_tracks:
         lines.append(
-            "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
+            "妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 缁撴灉娣峰悎 | mixed results, "
             f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
         )
     else:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都发生左右跨线 | all detected cycles cross the center line from left to right or right to left.")
-    lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
+        lines.append("妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 鎵€鏈夊懆鏈熼兘鍙戠敓宸﹀彸璺ㄧ嚎 | all detected cycles cross the center line from left to right or right to left.")
+    lines.append(f"妯悜绋冲畾鎬у垽瀹氶€昏緫 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
-        f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌ョ粨鏋?| Point-count check result: expected={point_count_summary['expected_point_count']}, "
         f"observed_min={point_count_summary['observed_min_point_count']}, observed_max={point_count_summary['observed_max_point_count']} "
         f"-> {'PASS' if point_count_summary['point_count_pass'] else 'FAIL'}"
     )
     if point_count_summary["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = point_count_summary["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
+            f"鎶ヨ鍖洪棿 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
             f"source={event.get('alarm_source', 'alarm_type')}, type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"object_distlong_start={event['earliest_distance_m']}m, "
@@ -1179,6 +1427,45 @@ def build_receding_recording_report(
             f"object_distlong_nearest={event['nearest_distance_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
+    if False:
+        lines.append(
+            f"閹躲儴顒熸潻鐐电敾閹粯顥呴弻?| Alarm continuity overall: "
+            f"segments={alarm_continuity_result.get('alarm_segment_count', 0)}, "
+            f"missing_alarm_frames={alarm_continuity_result.get('missing_alarm_frame_count', 0)} "
+            f"-> {'PASS' if alarm_continuity_result.get('alarm_continuity_pass') else 'FAIL'}"
+        )
+        for cycle in alarm_continuity_result.get("cycle_results", []):
+            first_alarm_frame = cycle.get("first_alarm_frame")
+            first_alarm_text = first_alarm_frame if first_alarm_frame is not None else "N/A"
+            lines.append(
+                f"閹躲儴顒熸潻鐐电敾閹冩噯閺?| Alarm continuity cycle #{cycle['cycle_index']}: "
+                f"track_frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+                f"loss_frame={cycle.get('loss_frame')}, first_alarm_frame={first_alarm_text}, "
+                f"check_until_frame={cycle.get('last_track_frame')}, "
+                f"expected_alarm_frames={cycle.get('expected_alarm_frame_count')}, "
+                f"observed_alarm_frames={cycle.get('observed_alarm_frame_count')}, "
+                f"missing_alarm_frames={cycle.get('missing_alarm_frame_count')} "
+                f"-> {'PASS' if cycle.get('continuous_alarm_pass') else 'FAIL'}"
+            )
+            for segment in cycle.get("alarm_segments", []):
+                lines.append(
+                    f"閹躲儴顒熺拠锔剧矎閸栨椽妫?| Alarm detail segment: cycle={cycle['cycle_index']}, "
+                    f"type={segment['alarm_type']} ({segment['alarm_label']}), "
+                    f"frames={segment['start_frame']}-{segment['end_frame']} ({segment['frame_count']} frames), "
+                    f"distance_start_end={segment['start_distance_m']}~{segment['end_distance_m']}m, "
+                    f"distance_range={segment['min_distance_m']}~{segment['max_distance_m']}m, "
+                    f"velocity={segment['min_velocity_mps']}~{segment['max_velocity_mps']}m/s"
+                )
+            for missing_run in cycle.get("missing_alarm_runs", []):
+                missing_frames = ",".join(str(frame_idx) for frame_idx in missing_run.get("frame_indices", []))
+                lines.append(
+                    f"鎼存梹濮ょ拃锔芥弓閹躲儴顒熺敮?| Missing required alarm frames: cycle={cycle['cycle_index']}, "
+                    f"frames={missing_run['start_frame']}-{missing_run['end_frame']} [{missing_frames}], "
+                    f"expected_alarm={missing_run.get('expected_alarm_type')} ({missing_run.get('expected_alarm_label')}), "
+                    f"distance_start_end={missing_run.get('start_distance_m')}~{missing_run.get('end_distance_m')}m, "
+                    f"distance_range={missing_run.get('min_distance_m')}~{missing_run.get('max_distance_m')}m, "
+                    f"velocity={missing_run.get('min_velocity_mps')}~{missing_run.get('max_velocity_mps')}m/s"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -1316,6 +1603,30 @@ def evaluate_dynamic_track_build(
     }
 
 
+def evaluate_approaching_alarm_continuity(tracks: list[Mapping[str, Any]], frames) -> dict[str, Any]:
+    from detect_loss import summarize_approaching_alarm_continuity
+
+    cycle_results = []
+    for idx, track in enumerate(tracks, 1):
+        summary = summarize_approaching_alarm_continuity(track, frames)
+        cycle_results.append(
+            {
+                "cycle_index": idx,
+                "first_frame": track.get("first_frame"),
+                "last_frame": track.get("last_frame"),
+                "loss_frame": track.get("loss_frame"),
+                **summary,
+            }
+        )
+
+    return {
+        "cycle_results": cycle_results,
+        "alarm_continuity_pass": bool(cycle_results) and all(result["continuous_alarm_pass"] for result in cycle_results),
+        "missing_alarm_frame_count": sum(result["missing_alarm_frame_count"] for result in cycle_results),
+        "alarm_segment_count": sum(len(result["alarm_segments"]) for result in cycle_results),
+    }
+
+
 def append_dynamic_track_build_summary(report: str, result: Mapping[str, Any]) -> str:
     extra_lines: list[str] = []
     cycle_results = result.get("cycle_results", [])
@@ -1358,6 +1669,47 @@ def replace_overall_result(report: str, overall_pass: bool) -> str:
             lines[idx] = f"{prefix}Overall result: {'PASS' if overall_pass else 'FAIL'}"
             return "\n".join(lines) + "\n"
     return report.rstrip("\n") + f"\nOverall result: {'PASS' if overall_pass else 'FAIL'}\n"
+
+
+def append_approaching_alarm_continuity_summary(report: str, result: Mapping[str, Any]) -> str:
+    extra_lines = [
+        f"报警连续性总结果 | Alarm continuity overall: segments={result.get('alarm_segment_count', 0)}, "
+        f"missing_alarm_frames={result.get('missing_alarm_frame_count', 0)} "
+        f"-> {'PASS' if result.get('alarm_continuity_pass') else 'FAIL'}"
+    ]
+    for cycle in result.get("cycle_results", []):
+        first_alarm_frame = cycle.get("first_alarm_frame")
+        first_alarm_text = first_alarm_frame if first_alarm_frame is not None else "N/A"
+        extra_lines.append(
+            f"报警连续性周期 | Alarm continuity cycle #{cycle['cycle_index']}: "
+            f"track_frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"loss_frame={cycle.get('loss_frame')}, first_alarm_frame={first_alarm_text}, "
+            f"check_until_frame={cycle.get('last_track_frame')}, "
+            f"expected_alarm_frames={cycle.get('expected_alarm_frame_count')}, "
+            f"observed_alarm_frames={cycle.get('observed_alarm_frame_count')}, "
+            f"missing_alarm_frames={cycle.get('missing_alarm_frame_count')} "
+            f"-> {'PASS' if cycle.get('continuous_alarm_pass') else 'FAIL'}"
+        )
+        for segment in cycle.get("alarm_segments", []):
+            extra_lines.append(
+                f"报警详情区间 | Alarm detail segment: cycle={cycle['cycle_index']}, "
+                f"type={segment['alarm_type']} ({segment['alarm_label']}), "
+                f"frames={segment['start_frame']}-{segment['end_frame']} ({segment['frame_count']} frames), "
+                f"distance_start_end={segment['start_distance_m']}~{segment['end_distance_m']}m, "
+                f"distance_range={segment['min_distance_m']}~{segment['max_distance_m']}m, "
+                f"velocity={segment['min_velocity_mps']}~{segment['max_velocity_mps']}m/s"
+            )
+        for missing_run in cycle.get("missing_alarm_runs", []):
+            missing_frames = ",".join(str(frame_idx) for frame_idx in missing_run.get("frame_indices", []))
+            extra_lines.append(
+                f"应报警未报警帧 | Missing required alarm frames: cycle={cycle['cycle_index']}, "
+                f"frames={missing_run['start_frame']}-{missing_run['end_frame']} [{missing_frames}], "
+                f"expected_alarm={missing_run.get('expected_alarm_type')} ({missing_run.get('expected_alarm_label')}), "
+                f"distance_start_end={missing_run.get('start_distance_m')}~{missing_run.get('end_distance_m')}m, "
+                f"distance_range={missing_run.get('min_distance_m')}~{missing_run.get('max_distance_m')}m, "
+                f"velocity={missing_run.get('min_velocity_mps')}~{missing_run.get('max_velocity_mps')}m/s"
+            )
+    return insert_lines_before_overall(report, extra_lines)
 
 
 def append_approaching_complete_cycle_summary(report: str, result: Mapping[str, Any]) -> str:
@@ -1483,22 +1835,22 @@ def build_approaching_recording_report(
     angle_tolerance = dynamic_angle_tolerance(scenario)
     lines = [
         "=" * 60,
-        "目标接近分析 | Approaching Target Analysis",
+        "鐩爣鎺ヨ繎鍒嗘瀽 | Approaching Target Analysis",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        "判定说明 | Criteria: 接近动态目标轨迹摘要 | approaching dynamic target track summary",
-        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
-        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
-        "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "鍒ゅ畾璇存槑 | Criteria: 鎺ヨ繎鍔ㄦ€佺洰鏍囪建杩规憳瑕?| approaching dynamic target track summary",
+        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"寤鸿埅鏃堕棿妫€鏌?| Track-build check: 鐐逛簯棣栨鍑虹幇鍚?{track_build_frame_limit} 甯у唴搴旂敓鎴?object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
+        "鐐逛簯鏁伴噺妫€鏌?| Point-count check: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
     ]
 
     if not tracks:
-        lines.append("[警告/ WARN] 未找到符合条件的接近目标周期 | No approaching target cycles found.")
+        lines.append("[璀﹀憡/ WARN] 鏈壘鍒扮鍚堟潯浠剁殑鎺ヨ繎鐩爣鍛ㄦ湡 | No approaching target cycles found.")
         return "\n".join(lines) + "\n"
 
     build_cycles = {
@@ -1515,7 +1867,7 @@ def build_approaching_recording_report(
         build_distance_text = f"{build_distance}m" if build_distance is not None else "N/A"
         last_object_distance_text = f"{last_object_distance}m" if last_object_distance is not None else "N/A"
         lines.append(
-            f"  周期#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
+            f"  鍛ㄦ湡#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
             f"(loss_frame={track['loss_frame']}), "
             f"detections={track['detections']}, "
             f"start_range={track['start_range_m']}m, "
@@ -1534,30 +1886,30 @@ def build_approaching_recording_report(
     stable_tracks = [track for track in tracks if track["lateral_status"] == "stable"]
     unstable_tracks = [track for track in tracks if track["lateral_status"] != "stable"]
     if stable_tracks and not unstable_tracks:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期未发生左右跨线 | all detected cycles stay on one side of the center line.")
+        lines.append("妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 鎵€鏈夊懆鏈熸湭鍙戠敓宸﹀彸璺ㄧ嚎 | all detected cycles stay on one side of the center line.")
     elif stable_tracks:
         lines.append(
-            "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
+            "妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 缁撴灉娣峰悎 | mixed results, "
             f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
         )
     else:
-        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都发生左右跨线 | all detected cycles cross the center line from left to right or right to left.")
-    lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
+        lines.append("妯悜绋冲畾鎬х粨璁?| Lateral stability summary: 鎵€鏈夊懆鏈熼兘鍙戠敓宸﹀彸璺ㄧ嚎 | all detected cycles cross the center line from left to right or right to left.")
+    lines.append(f"妯悜绋冲畾鎬у垽瀹氶€昏緫 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
     lines.append(
-        f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌ョ粨鏋?| Point-count check result: expected={point_count_summary['expected_point_count']}, "
         f"observed_min={point_count_summary['observed_min_point_count']}, observed_max={point_count_summary['observed_max_point_count']} "
         f"-> {'PASS' if point_count_summary['point_count_pass'] else 'FAIL'}"
     )
     if point_count_summary["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = point_count_summary["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
+            f"鎶ヨ鍖洪棿 | Alarm event: cycle={event.get('cycle_index', 'N/A')}, "
             f"source={event.get('alarm_source', 'alarm_type')}, type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"object_distlong_start={event['earliest_distance_m']}m, "
@@ -1565,6 +1917,70 @@ def build_approaching_recording_report(
             f"object_distlong_nearest={event['nearest_distance_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
+    return "\n".join(lines) + "\n"
+
+
+def build_approaching_alarm_report(
+    frame_path: Path,
+    profile: BrandProfile,
+    selection: Selection,
+    scenario: Mapping[str, Any],
+    alarm_continuity_result: Mapping[str, Any],
+) -> str:
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 60,
+        "鎶ヨ璇︽儏鍒嗘瀽 | Alarm Detail Analysis",
+        "=" * 60,
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "判定说明 | Criteria: once an alarm starts, it must continue every frame until object disappears; any missed alarm frame is FAIL.",
+        f"鎶ヨ杩炵画鎬ф€荤粨鏋?| Alarm continuity overall: segments={alarm_continuity_result.get('alarm_segment_count', 0)}, "
+        f"missing_alarm_frames={alarm_continuity_result.get('missing_alarm_frame_count', 0)} "
+        f"-> {'PASS' if alarm_continuity_result.get('alarm_continuity_pass') else 'FAIL'}",
+    ]
+
+    if not alarm_continuity_result.get("cycle_results"):
+        lines.append("[WARN] No alarm continuity cycles found.")
+        return "\n".join(lines) + "\n"
+
+    for cycle in alarm_continuity_result.get("cycle_results", []):
+        first_alarm_frame = cycle.get("first_alarm_frame")
+        first_alarm_text = first_alarm_frame if first_alarm_frame is not None else "N/A"
+        lines.append(
+            f"鎶ヨ杩炵画鎬у懆鏈?| Alarm continuity cycle #{cycle['cycle_index']}: "
+            f"track_frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"loss_frame={cycle.get('loss_frame')}, first_alarm_frame={first_alarm_text}, "
+            f"check_until_frame={cycle.get('last_track_frame')}, "
+            f"expected_alarm_frames={cycle.get('expected_alarm_frame_count')}, "
+            f"observed_alarm_frames={cycle.get('observed_alarm_frame_count')}, "
+            f"missing_alarm_frames={cycle.get('missing_alarm_frame_count')} "
+            f"-> {'PASS' if cycle.get('continuous_alarm_pass') else 'FAIL'}"
+        )
+        for segment in cycle.get("alarm_segments", []):
+            lines.append(
+                f"鎶ヨ璇︽儏鍖洪棿 | Alarm detail segment: cycle={cycle['cycle_index']}, "
+                f"type={segment['alarm_type']} ({segment['alarm_label']}), "
+                f"frames={segment['start_frame']}-{segment['end_frame']} ({segment['frame_count']} frames), "
+                f"start_distance={segment['start_distance_m']}m, end_distance={segment['end_distance_m']}m, "
+                f"min_distance={segment['min_distance_m']}m, max_distance={segment['max_distance_m']}m, "
+                f"velocity={segment['min_velocity_mps']}~{segment['max_velocity_mps']}m/s"
+            )
+        for missing_run in cycle.get("missing_alarm_runs", []):
+            missing_frames = ",".join(str(frame_idx) for frame_idx in missing_run.get("frame_indices", []))
+            lines.append(
+                f"搴旀姤璀︽湭鎶ヨ甯?| Missing required alarm frames: cycle={cycle['cycle_index']}, "
+                f"frames={missing_run['start_frame']}-{missing_run['end_frame']} [{missing_frames}], "
+                f"expected_alarm={missing_run.get('expected_alarm_type')} ({missing_run.get('expected_alarm_label')}), "
+                f"missing_count={len(missing_run.get('frame_indices', []))}, "
+                f"distance={missing_run.get('min_distance_m')}~{missing_run.get('max_distance_m')}m, "
+                f"velocity={missing_run.get('min_velocity_mps')}~{missing_run.get('max_velocity_mps')}m/s"
+            )
+
     return "\n".join(lines) + "\n"
 
 
@@ -1579,100 +1995,100 @@ def build_fixed_recording_report(
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     criteria_2 = {
-        "range": "判定条件2 | Criteria 2: 读取距离与模拟器设置距离误差在 +/-0.4m 内 | measured range error is within +/-0.4m of configured simulator range",
-        "speed": "判定条件2 | Criteria 2: 读取速度与模拟器设置速度误差在 +/-0.1m/s 内 | measured speed error is within +/-0.1m/s of configured simulator speed",
+        "range": "鍒ゅ畾鏉′欢2 | Criteria 2: 璇诲彇璺濈涓庢ā鎷熷櫒璁剧疆璺濈璇樊鍦?+/-0.4m 鍐?| measured range error is within +/-0.4m of configured simulator range",
+        "speed": "鍒ゅ畾鏉′欢2 | Criteria 2: 璇诲彇閫熷害涓庢ā鎷熷櫒璁剧疆閫熷害璇樊鍦?+/-0.1m/s 鍐?| measured speed error is within +/-0.1m/s of configured simulator speed",
     }.get(
         validation_mode,
         "Criteria 2: measured horizontal angle error is within configured simulator angle tolerance",
     )
     lines = [
         "=" * 60,
-        "静态目标验证 | Fixed Target Validation",
+        "闈欐€佺洰鏍囬獙璇?| Fixed Target Validation",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        "判定条件1 | Criteria 1: 点云连续、无中断、不能连续3帧丢失 | point cloud is continuous, no interruption, no 3 consecutive missed frames",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "鍒ゅ畾鏉′欢1 | Criteria 1: 鐐逛簯杩炵画銆佹棤涓柇銆佷笉鑳借繛缁?甯т涪澶?| point cloud is continuous, no interruption, no 3 consecutive missed frames",
         criteria_2,
-        "判定条件3 | Criteria 3: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
-        "角度说明 | Angle note: xiaoniu 仅关注水平角 AngleAZ，原始值按弧度处理，日志中显示转换后的角度值 | xiaoniu only checks horizontal angle AngleAZ; raw value is treated as radians and the log shows converted degrees",
+        "鍒ゅ畾鏉′欢3 | Criteria 3: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
+        "瑙掑害璇存槑 | Angle note: xiaoniu 浠呭叧娉ㄦ按骞宠 AngleAZ锛屽師濮嬪€兼寜寮у害澶勭悊锛屾棩蹇椾腑鏄剧ず杞崲鍚庣殑瑙掑害鍊?| xiaoniu only checks horizontal angle AngleAZ; raw value is treated as radians and the log shows converted degrees",
     ]
 
     if not result["detections"]:
-        lines.append("[失败/ FAIL] 在 frame.txt 中未找到匹配的静态目标点 | No matching fixed-target detections found in frame.txt.")
+        lines.append("[澶辫触/ FAIL] 鍦?frame.txt 涓湭鎵惧埌鍖归厤鐨勯潤鎬佺洰鏍囩偣 | No matching fixed-target detections found in frame.txt.")
         return "\n".join(lines) + "\n"
 
     lines.append(
-        f"匹配帧数 | Detections: {result['detections']} / {result['frame_count']} frames "
+        f"鍖归厤甯ф暟 | Detections: {result['detections']} / {result['frame_count']} frames "
         f"(frames={result['first_frame']}-{result['last_frame']})"
     )
     lines.append(
-        f"距离统计 | Range: avg={result['avg_range_m']}m, min={result['min_range_m']}m, max={result['max_range_m']}m, "
+        f"璺濈缁熻 | Range: avg={result['avg_range_m']}m, min={result['min_range_m']}m, max={result['max_range_m']}m, "
         f"configured={scenario['range']}m"
     )
     lines.append(
-        f"距离误差 | Range error: min={result['min_range_error_m']}m, max={result['max_range_error_m']}m, "
+        f"璺濈璇樊 | Range error: min={result['min_range_error_m']}m, max={result['max_range_error_m']}m, "
         f"max_abs={result['max_abs_range_error_m']}m, avg_abs={result['avg_abs_range_error_m']}m"
     )
     lines.append(
-        f"速度角度统计 | Velocity/angle: avg_velocity={result['avg_velocity']}m/s, "
+        f"閫熷害瑙掑害缁熻 | Velocity/angle: avg_velocity={result['avg_velocity']}m/s, "
         f"avg_angle_az={result['avg_angle_az_deg']}deg, min_angle_az={result['min_angle_az_deg']}deg, "
         f"max_angle_az={result['max_angle_az_deg']}deg, lateral_status={result['lateral_status']}"
     )
     lines.append(
-        f"连续性检查 | Continuity check: max consecutive missed frames = {result['max_consecutive_missing']} "
+        f"杩炵画鎬ф鏌?| Continuity check: max consecutive missed frames = {result['max_consecutive_missing']} "
         f"-> {'PASS' if result['loss_free'] else 'FAIL'}"
     )
     lines.append(
-        f"点云数量检查 | Point-count check: expected={result['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌?| Point-count check: expected={result['expected_point_count']}, "
         f"observed_min={result['observed_min_point_count']}, observed_max={result['observed_max_point_count']} "
         f"-> {'PASS' if result['point_count_pass'] else 'FAIL'}"
     )
     if result["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = result["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     if result["longest_missing_run"]:
         start_frame, end_frame, run_length = result["longest_missing_run"]
         lines.append(
-            f"最长连续丢帧区间 | Longest consecutive missing run: "
+            f"鏈€闀胯繛缁涪甯у尯闂?| Longest consecutive missing run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     if validation_mode == "angle":
         lines.append(
-            f"角度容差检查 | Angle tolerance check (+/-{result['angle_error_tolerance_deg']}deg): "
+            f"瑙掑害瀹瑰樊妫€鏌?| Angle tolerance check (+/-{result['angle_error_tolerance_deg']}deg): "
             f"max abs error = {result['max_abs_angle_error_deg']}deg "
             f"-> {'PASS' if result['angle_pass'] else 'FAIL'}"
         )
     elif validation_mode == "range":
         lines.append(
-            f"距离容差检查 | Range tolerance check (+/-{result['range_error_tolerance_m']}m): "
+            f"璺濈瀹瑰樊妫€鏌?| Range tolerance check (+/-{result['range_error_tolerance_m']}m): "
             f"max abs error = {result['max_abs_range_error_m']}m "
             f"-> {'PASS' if result['range_pass'] else 'FAIL'}"
         )
     else:
         lines.append(
-            f"速度容差检查 | Speed tolerance check (+/-{result['speed_error_tolerance_mps']}m/s): "
+            f"閫熷害瀹瑰樊妫€鏌?| Speed tolerance check (+/-{result['speed_error_tolerance_mps']}m/s): "
             f"max abs error = {result['max_abs_speed_error_mps']}m/s "
             f"-> {'PASS' if result['speed_pass'] else 'FAIL'}"
         )
     if result["frames_without_detection"]:
         sample_frames = ", ".join(str(frame) for frame in result["frames_without_detection"][:10])
-        lines.append(f"未匹配到目标点的帧 | Frames without matching detection: {sample_frames}")
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+        lines.append(f"鏈尮閰嶅埌鐩爣鐐圭殑甯?| Frames without matching detection: {sample_frames}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"鎶ヨ鍖洪棿 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"range={event['min_range_m']}~{event['max_range_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
-    lines.append(f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    lines.append(f"鏈€缁堢粨璁?| Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
     return "\n".join(lines) + "\n"
 
 
@@ -1688,71 +2104,71 @@ def build_multi_resolution_report(
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
-        "多目标距离分辨力验证 | Multi-target Range Resolution Validation",
+        "澶氱洰鏍囪窛绂诲垎杈ㄥ姏楠岃瘉 | Multi-target Range Resolution Validation",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        "判定条件1 | Criteria 1: 目标连续检出、无中断、不能连续3帧出现 Object目标数<2 | target detection is continuous, no interruption, no 3 consecutive frames with Object target count < 2",
-        "判定条件2 | Criteria 2: 距离分辨力应 < 0.85m | range resolution should be < 0.85m",
-        "判定条件3 | Criteria 3: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
-        "判定说明 | Resolution rule: 按 [Object] 段的目标行数判断，2行表示2个目标，1行或0行表示 Object目标数<2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
-        "判定方法 | Decision method: 距离分辨力单帧判定按 [Object] 行数，>=2 行为已分辨，<2 行为未分辨 | range-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
-        "连续性判定 | Continuity method: 首次已分辨帧之前视为建航阶段，不计入丢失；首次已分辨后连续3帧未分辨则连续性失败 | frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
-        "二分判定 | Binary-search method: 某个距离间隔只要出现任意已分辨帧，即认为该间隔可分辨并继续尝试更小间隔；完全无已分辨帧则认为已合并并尝试更大间隔。resolution_before_merge 为最小已分辨测试间隔，merge_threshold 为最大已合并测试间隔 | any resolved frame means the tested range gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "鍒ゅ畾鏉′欢1 | Criteria 1: 鐩爣杩炵画妫€鍑恒€佹棤涓柇銆佷笉鑳借繛缁?甯у嚭鐜?Object鐩爣鏁?2 | target detection is continuous, no interruption, no 3 consecutive frames with Object target count < 2",
+        "鍒ゅ畾鏉′欢2 | Criteria 2: 璺濈鍒嗚鲸鍔涘簲 < 0.85m | range resolution should be < 0.85m",
+        "鍒ゅ畾鏉′欢3 | Criteria 3: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
+        "鍒ゅ畾璇存槑 | Resolution rule: 鎸?[Object] 娈电殑鐩爣琛屾暟鍒ゆ柇锛?琛岃〃绀?涓洰鏍囷紝1琛屾垨0琛岃〃绀?Object鐩爣鏁?2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
+        "鍒ゅ畾鏂规硶 | Decision method: 璺濈鍒嗚鲸鍔涘崟甯у垽瀹氭寜 [Object] 琛屾暟锛?=2 琛屼负宸插垎杈紝<2 琛屼负鏈垎杈?| range-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
+        "杩炵画鎬у垽瀹?| Continuity method: 棣栨宸插垎杈ㄥ抚涔嬪墠瑙嗕负寤鸿埅闃舵锛屼笉璁″叆涓㈠け锛涢娆″凡鍒嗚鲸鍚庤繛缁?甯ф湭鍒嗚鲸鍒欒繛缁€уけ璐?| frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
+        "浜屽垎鍒ゅ畾 | Binary-search method: 鏌愪釜璺濈闂撮殧鍙鍑虹幇浠绘剰宸插垎杈ㄥ抚锛屽嵆璁や负璇ラ棿闅斿彲鍒嗚鲸骞剁户缁皾璇曟洿灏忛棿闅旓紱瀹屽叏鏃犲凡鍒嗚鲸甯у垯璁や负宸插悎骞跺苟灏濊瘯鏇村ぇ闂撮殧銆俽esolution_before_merge 涓烘渶灏忓凡鍒嗚鲸娴嬭瘯闂撮殧锛宮erge_threshold 涓烘渶澶у凡鍚堝苟娴嬭瘯闂撮殧 | any resolved frame means the tested range gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
     ]
 
     lines.append(
-        f"二分搜索结果 | Binary-search result: "
+        f"浜屽垎鎼滅储缁撴灉 | Binary-search result: "
         f"resolution_before_merge={result['resolution_before_merge_m']}m, "
         f"merge_threshold={result['merge_threshold_m']}m"
     )
     lines.append(
-        f"两目标检出统计 | Two-target detection summary: "
+        f"涓ょ洰鏍囨鍑虹粺璁?| Two-target detection summary: "
         f"resolved_frames={result['resolved_frame_count']} / {result['frame_count']}, "
         f"avg_detected_gap={result['avg_detected_gap_m']}m"
     )
     lines.append(
-        f"连续性检查 | Continuity check: max consecutive frames with Object target count < 2 = {result['max_consecutive_unresolved']} "
+        f"杩炵画鎬ф鏌?| Continuity check: max consecutive frames with Object target count < 2 = {result['max_consecutive_unresolved']} "
         f"-> {'PASS' if result['continuity_pass'] else 'FAIL'}"
     )
     lines.append(
-        f"点云数量检查 | Point-count check: expected={result['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌?| Point-count check: expected={result['expected_point_count']}, "
         f"observed_min={result['observed_min_point_count']}, observed_max={result['observed_max_point_count']} "
         f"-> {'PASS' if result['point_count_pass'] else 'FAIL'}"
     )
     if result["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = result["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     if result["longest_unresolved_run"]:
         start_frame, end_frame, run_length = result["longest_unresolved_run"]
         lines.append(
-            f"最长连续 Object目标数<2 区间 | Longest consecutive run with Object target count < 2: "
+            f"鏈€闀胯繛缁?Object鐩爣鏁?2 鍖洪棿 | Longest consecutive run with Object target count < 2: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     lines.append(
-        f"距离分辨力检查 | Range resolution check: "
+        f"璺濈鍒嗚鲸鍔涙鏌?| Range resolution check: "
         f"{result['resolution_before_merge_m']}m < 0.85m "
         f"-> {'PASS' if result['resolution_pass'] else 'FAIL'}"
     )
     if result["unresolved_frames"]:
         sample_frames = ", ".join(str(frame) for frame in result["unresolved_frames"][:10])
-        lines.append(f"Object目标数<2 的帧 | Frames with Object target count < 2: {sample_frames}")
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+        lines.append(f"Object鐩爣鏁?2 鐨勫抚 | Frames with Object target count < 2: {sample_frames}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"鎶ヨ鍖洪棿 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"range={event['min_range_m']}~{event['max_range_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
-    lines.append(f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    lines.append(f"鏈€缁堢粨璁?| Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
     return "\n".join(lines) + "\n"
 
 
@@ -1765,73 +2181,74 @@ def build_multi_speed_resolution_report(
     alarm_summary: Mapping[str, Any],
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
-        "多目标速度分辨力验证 | Multi-target Speed Resolution Validation",
+        "澶氱洰鏍囬€熷害鍒嗚鲸鍔涢獙璇?| Multi-target Speed Resolution Validation",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        "判定条件1 | Criteria 1: 目标连续检出、无中断、不能连续3帧出现 Object目标数<2 | target detection is continuous, no interruption, no 3 consecutive frames with Object target count < 2",
-        "判定条件2 | Criteria 2: 速度分辨力应 < 0.2m/s | speed resolution should be < 0.2m/s",
-        "判定条件3 | Criteria 3: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
-        "判定说明 | Resolution rule: 按 [Object] 段的目标行数判断，2行表示2个目标，1行或0行表示 Object目标数<2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
-        "判定方法 | Decision method: 速度分辨力单帧判定按 [Object] 行数，>=2 行为已分辨，<2 行为未分辨 | speed-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
-        "连续性判定 | Continuity method: 首次已分辨帧之前视为建航阶段，不计入丢失；首次已分辨后连续3帧未分辨则连续性失败 | frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
-        "二分判定 | Binary-search method: 某个速度间隔只要出现任意已分辨帧，即认为该间隔可分辨并继续尝试更小间隔；完全无已分辨帧则认为已合并并尝试更大间隔。resolution_before_merge 为最小已分辨测试间隔，merge_threshold 为最大已合并测试间隔 | any resolved frame means the tested speed gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        "鍒ゅ畾鏉′欢1 | Criteria 1: 鐩爣杩炵画妫€鍑恒€佹棤涓柇銆佷笉鑳借繛缁?甯у嚭鐜?Object鐩爣鏁?2 | target detection is continuous, no interruption, no 3 consecutive frames with Object target count < 2",
+        "鍒ゅ畾鏉′欢2 | Criteria 2: 閫熷害鍒嗚鲸鍔涘簲 < 0.2m/s | speed resolution should be < 0.2m/s",
+        "鍒ゅ畾鏉′欢3 | Criteria 3: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
+        "鍒ゅ畾璇存槑 | Resolution rule: 鎸?[Object] 娈电殑鐩爣琛屾暟鍒ゆ柇锛?琛岃〃绀?涓洰鏍囷紝1琛屾垨0琛岃〃绀?Object鐩爣鏁?2 | use the number of rows under [Object]: 2 rows means two targets, 1 or 0 row means Object target count < 2",
+        "鍒ゅ畾鏂规硶 | Decision method: 閫熷害鍒嗚鲸鍔涘崟甯у垽瀹氭寜 [Object] 琛屾暟锛?=2 琛屼负宸插垎杈紝<2 琛屼负鏈垎杈?| speed-resolution frame rule: a frame is resolved when [Object] has at least 2 rows; otherwise it is unresolved.",
+        "杩炵画鎬у垽瀹?| Continuity method: 棣栨宸插垎杈ㄥ抚涔嬪墠瑙嗕负寤鸿埅闃舵锛屼笉璁″叆涓㈠け锛涢娆″凡鍒嗚鲸鍚庤繛缁?甯ф湭鍒嗚鲸鍒欒繛缁€уけ璐?| frames before the first resolved frame are target build-up and not counted as loss; after the first resolved frame, 3 consecutive unresolved frames fail continuity.",
+        "浜屽垎鍒ゅ畾 | Binary-search method: 鏌愪釜閫熷害闂撮殧鍙鍑虹幇浠绘剰宸插垎杈ㄥ抚锛屽嵆璁や负璇ラ棿闅斿彲鍒嗚鲸骞剁户缁皾璇曟洿灏忛棿闅旓紱瀹屽叏鏃犲凡鍒嗚鲸甯у垯璁や负宸插悎骞跺苟灏濊瘯鏇村ぇ闂撮殧銆俽esolution_before_merge 涓烘渶灏忓凡鍒嗚鲸娴嬭瘯闂撮殧锛宮erge_threshold 涓烘渶澶у凡鍚堝苟娴嬭瘯闂撮殧 | any resolved frame means the tested speed gap is resolvable and the next search tries a smaller gap; no resolved frame means merged and the next search tries a larger gap. resolution_before_merge is the smallest tested resolvable gap; merge_threshold is the largest tested merged gap.",
     ]
 
     lines.append(
-        f"二分搜索结果 | Binary-search result: "
+        f"浜屽垎鎼滅储缁撴灉 | Binary-search result: "
         f"resolution_before_merge={result['resolution_before_merge_mps']}m/s, "
         f"merge_threshold={result['merge_threshold_mps']}m/s"
     )
     lines.append(
-        f"两目标检出统计 | Two-target detection summary: "
+        f"涓ょ洰鏍囨鍑虹粺璁?| Two-target detection summary: "
         f"resolved_frames={result['resolved_frame_count']} / {result['frame_count']}, "
         f"avg_detected_speed_gap={result['avg_detected_gap_mps']}m/s"
     )
     lines.append(
-        f"连续性检查 | Continuity check: max consecutive frames with Object target count < 2 = {result['max_consecutive_unresolved']} "
+        f"杩炵画鎬ф鏌?| Continuity check: max consecutive frames with Object target count < 2 = {result['max_consecutive_unresolved']} "
         f"-> {'PASS' if result['continuity_pass'] else 'FAIL'}"
     )
     lines.append(
-        f"点云数量检查 | Point-count check: expected={result['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌?| Point-count check: expected={result['expected_point_count']}, "
         f"observed_min={result['observed_min_point_count']}, observed_max={result['observed_max_point_count']} "
         f"-> {'PASS' if result['point_count_pass'] else 'FAIL'}"
     )
     if result["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = result["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     if result["longest_unresolved_run"]:
         start_frame, end_frame, run_length = result["longest_unresolved_run"]
         lines.append(
-            f"最长连续 Object目标数<2 区间 | Longest consecutive run with Object target count < 2: "
+            f"鏈€闀胯繛缁?Object鐩爣鏁?2 鍖洪棿 | Longest consecutive run with Object target count < 2: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     lines.append(
-        f"速度分辨力检查 | Speed resolution check: "
+        f"閫熷害鍒嗚鲸鍔涙鏌?| Speed resolution check: "
         f"{result['resolution_before_merge_mps']}m/s < 0.2m/s "
         f"-> {'PASS' if result['resolution_pass'] else 'FAIL'}"
     )
     if result["unresolved_frames"]:
         sample_frames = ", ".join(str(frame) for frame in result["unresolved_frames"][:10])
-        lines.append(f"Object目标数<2 的帧 | Frames with Object target count < 2: {sample_frames}")
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+        lines.append(f"Object鐩爣鏁?2 鐨勫抚 | Frames with Object target count < 2: {sample_frames}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"鎶ヨ鍖洪棿 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"range={event['min_range_m']}~{event['max_range_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
-    lines.append(f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    lines.append(f"鏈€缁堢粨璁?| Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
     return "\n".join(lines) + "\n"
 
 
@@ -1876,64 +2293,65 @@ def build_speed_sweep_report(
     alarm_summary: Mapping[str, Any],
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     lines = [
         "=" * 60,
-        "测速范围验证 | Speed Sweep Range Validation",
+        "娴嬮€熻寖鍥撮獙璇?| Speed Sweep Range Validation",
         "=" * 60,
-        f"生成时间 | Generated at: {generated_at}",
-        f"点云文件 | Frame file: {frame_path.name}",
-        f"点云目录 | Frame directory: {frame_path.parent}",
-        f"车型配置 | Profile: {profile.key}",
-        f"场景编号 | Scenario ID: {selection_tag(selection)}",
-        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
-        f"判定条件 | Criteria: 测速正确范围应完整覆盖 {scenario['speed_min']}~{scenario['speed_max']}m/s | measured valid speed range should fully cover {scenario['speed_min']}~{scenario['speed_max']}m/s",
-        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
-        "点云数量检查 | Point-count check: 点云数量应等于 虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
+        f"鐢熸垚鏃堕棿 | Generated at: {generated_at}",
+        f"鐐逛簯鏂囦欢 | Frame file: {frame_path.name}",
+        f"鐐逛簯鐩綍 | Frame directory: {frame_path.parent}",
+        f"杞﹀瀷閰嶇疆 | Profile: {profile.key}",
+        f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
+        f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
+        f"鍒ゅ畾鏉′欢 | Criteria: 娴嬮€熸纭寖鍥村簲瀹屾暣瑕嗙洊 {scenario['speed_min']}~{scenario['speed_max']}m/s | measured valid speed range should fully cover {scenario['speed_min']}~{scenario['speed_max']}m/s",
+        f"寤鸿埅鏃堕棿妫€鏌?| Track-build check: 鐐逛簯棣栨鍑虹幇鍚?{track_build_frame_limit} 甯у唴搴旂敓鎴?object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
+        "鐐逛簯鏁伴噺妫€鏌?| Point-count check: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
     ]
 
     if result["matched_frame_count"] == 0:
-        lines.append("[失败/ FAIL] 未找到10m附近的扫速目标点 | No sweep target detections found near 10m.")
+        lines.append("[澶辫触/ FAIL] 鏈壘鍒?0m闄勮繎鐨勬壂閫熺洰鏍囩偣 | No sweep target detections found near 10m.")
         return "\n".join(lines) + "\n"
 
     lines.append(
-        f"检出帧统计 | Matched frames: {result['matched_frame_count']} / {result['frame_count']}"
+        f"妫€鍑哄抚缁熻 | Matched frames: {result['matched_frame_count']} / {result['frame_count']}"
     )
     lines.append(
-        f"测速覆盖区间 | Observed speed coverage: "
+        f"娴嬮€熻鐩栧尯闂?| Observed speed coverage: "
         f"{result['observed_speed_min']}~{result['observed_speed_max']}m/s"
     )
     lines.append(
-        f"离散覆盖桶 | Covered speed bins: "
+        f"绂绘暎瑕嗙洊妗?| Covered speed bins: "
         f"{result['covered_speed_min']}~{result['covered_speed_max']}m/s"
     )
     lines.append(
-        f"点云数量检查 | Point-count check: expected={result['expected_point_count']}, "
+        f"鐐逛簯鏁伴噺妫€鏌?| Point-count check: expected={result['expected_point_count']}, "
         f"observed_min={result['observed_min_point_count']}, observed_max={result['observed_max_point_count']} "
         f"-> {'PASS' if result['point_count_pass'] else 'FAIL'}"
     )
     if result["longest_point_count_mismatch_run"]:
         start_frame, end_frame, run_length = result["longest_point_count_mismatch_run"]
         lines.append(
-            f"最长点云数量异常区间 | Longest point-count mismatch run: "
+            f"鏈€闀跨偣浜戞暟閲忓紓甯稿尯闂?| Longest point-count mismatch run: "
             f"{start_frame}-{end_frame} ({run_length} frames)"
         )
     lines.append(
-        f"测速范围检查 | Speed-range check: "
+        f"娴嬮€熻寖鍥存鏌?| Speed-range check: "
         f"{scenario['speed_min']}~{scenario['speed_max']}m/s "
         f"-> {'PASS' if result['speed_range_pass'] else 'FAIL'}"
     )
     if result["missing_speed_bins"]:
         sample_bins = ", ".join(f"{value}m/s" for value in result["missing_speed_bins"][:20])
-        lines.append(f"缺失速度桶 | Missing speed bins: {sample_bins}")
-    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+        lines.append(f"缂哄け閫熷害妗?| Missing speed bins: {sample_bins}")
+    lines.append(f"鎶ヨ浜嬩欢鏁?| Alarm event count: {alarm_summary['alarm_event_count']}")
     for event in alarm_summary["alarm_events"]:
         lines.append(
-            f"报警区间 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
+            f"鎶ヨ鍖洪棿 | Alarm event: type={event['alarm_type']} ({event['alarm_label']}), "
             f"frames={event['start_frame']}-{event['end_frame']}, "
             f"range={event['min_range_m']}~{event['max_range_m']}m, "
             f"velocity={event['min_velocity_mps']}~{event['max_velocity_mps']}m/s"
         )
-    lines.append(f"最终结论 | Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    lines.append(f"鏈€缁堢粨璁?| Overall result: {'PASS' if result['overall_pass'] else 'FAIL'}")
     return "\n".join(lines) + "\n"
 
 
@@ -1961,6 +2379,140 @@ def build_speed_sweep_track_build_result(
     return evaluate_dynamic_track_build([track], frame_limit=frame_limit)
 
 
+_MOJIBAKE_HINTS = (
+    "鐩", "鐐", "鍦", "杞", "鍒", "鍔", "寤", "瀹", "鎶", "妯",
+    "璺", "绋", "缁", "妫", "鏌", "閫", "瑙", "鏈", "鍛", "涓",
+    "澶", "娴", "浜", "€",
+)
+
+_REPORT_LABELS_BY_MARKER = (
+    ("Receding Target Loss Analysis", "目标远离丢失分析"),
+    ("Approaching Target Analysis", "目标接近分析"),
+    ("Alarm Detail Analysis", "报警详情分析"),
+    ("Fixed Target Validation", "静态目标验证"),
+    ("Multi-target Range Resolution Validation", "多目标距离分辨力验证"),
+    ("Multi-target Speed Resolution Validation", "多目标速度分辨力验证"),
+    ("Speed Sweep Range Validation", "测速范围验证"),
+    ("Generated at:", "生成时间"),
+    ("Frame file:", "点云文件"),
+    ("Frame directory:", "点云目录"),
+    ("Profile:", "车型配置"),
+    ("Scenario ID:", "场景编号"),
+    ("Scenario:", "场景说明"),
+    ("Criteria 1:", "判定条件1"),
+    ("Criteria 2:", "判定条件2"),
+    ("Criteria 3:", "判定条件3"),
+    ("Criteria:", "判定说明"),
+    ("Dynamic point matching:", "动态点匹配"),
+    ("Track-build check:", "建航时间检查"),
+    ("Point-count check result:", "点云数量检查结果"),
+    ("Point-count check:", "点云数量检查"),
+    ("Point-cloud continuity overall:", "点云连续性总结果"),
+    ("Point-cloud continuity details:", "点云连续性明细"),
+    ("3-frame loss overall:", "连续3帧丢失总结果"),
+    ("Longitudinal distance error check", "纵向距离误差检查"),
+    ("Max longitudinal error detail:", "最大纵向误差位置"),
+    ("Lateral distance error record:", "横向距离误差记录"),
+    ("Lateral distance error check", "横向距离误差检查"),
+    ("Max lateral error detail:", "最大横向误差位置"),
+    ("Velocity error check", "速度误差检查"),
+    ("Max velocity error detail:", "最大速度误差位置"),
+    ("Angle bias estimate:", "角度偏差估计"),
+    ("Max angle bias detail:", "最大角度偏差位置"),
+    ("Distance error model:", "距离误差判定逻辑"),
+    ("Distance error sample:", "距离误差样例"),
+    ("Loss distance per cycle:", "各周期丢失距离"),
+    ("Farthest loss distance across cycles:", "最远丢失距离"),
+    ("Farthest detected range across cycles:", "最远检测距离"),
+    ("Lateral stability summary:", "横向稳定性结论"),
+    ("Lateral stability criteria:", "横向稳定性判定逻辑"),
+    ("Longest point-count mismatch run:", "最长点云数量异常区间"),
+    ("Longest consecutive missing run:", "最长连续丢帧区间"),
+    ("Alarm event count:", "报警事件数"),
+    ("Alarm event:", "报警区间"),
+    ("Alarm continuity overall:", "报警连续性总结果"),
+    ("Alarm continuity cycle #", "报警连续性周期"),
+    ("Alarm detail segment:", "报警详情区间"),
+    ("Missing required alarm frames:", "应报警未报警帧"),
+    ("Track-build overall:", "建航时间总结果"),
+    ("Track-build details:", "建航时间明细"),
+    ("Track-build cycle #", "建航时间明细"),
+    ("Complete-cycle object distance summary:", "完整周期目标距离汇总"),
+    ("Complete-cycle object distance cycle #", "完整周期目标距离明细"),
+    ("Continuous-track check:", "连续跟踪检查"),
+    ("Object-ID stability:", "ID跳变检查"),
+    ("Lateral-stability check:", "航迹稳定检查"),
+    ("Max-distance check:", "最大距离检查"),
+    ("Applied tolerance:", "实际阈值"),
+    ("Angle note:", "角度说明"),
+    ("Detections:", "匹配帧数"),
+    ("Range:", "距离统计"),
+    ("Range error:", "距离误差"),
+    ("Velocity/angle:", "速度角度统计"),
+    ("Continuity check:", "连续性检查"),
+    ("Angle tolerance check", "角度容差检查"),
+    ("Range tolerance check", "距离容差检查"),
+    ("Speed tolerance check", "速度容差检查"),
+    ("Frames without matching detection:", "未匹配到目标点的帧"),
+    ("Resolution rule:", "判定说明"),
+    ("Decision method:", "判定方法"),
+    ("Continuity method:", "连续性判定"),
+    ("Binary-search method:", "二分判定"),
+    ("Binary-search result:", "二分搜索结果"),
+    ("Two-target detection summary:", "两目标检测统计"),
+    ("Longest consecutive run with Object target count < 2:", "最长连续Object目标数<2区间"),
+    ("Range resolution check:", "距离分辨力检查"),
+    ("Speed resolution check:", "速度分辨力检查"),
+    ("Frames with Object target count < 2:", "Object目标数<2的帧"),
+    ("Matched frames:", "检测帧统计"),
+    ("Observed speed coverage:", "测速覆盖区间"),
+    ("Covered speed bins:", "覆盖速度档"),
+    ("Speed-range check:", "测速范围检查"),
+    ("Missing speed bins:", "缺失速度档"),
+    ("Overall result:", "最终结论"),
+)
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    return any("\ue000" <= char <= "\uf8ff" or char == "\ufffd" for char in text) or any(
+        hint in text for hint in _MOJIBAKE_HINTS
+    )
+
+
+def _replace_report_label_from_marker(line: str) -> str:
+    if "|" not in line:
+        return line
+    indent_len = len(line) - len(line.lstrip())
+    indent = line[:indent_len]
+    stripped = line[indent_len:]
+    for marker, label in _REPORT_LABELS_BY_MARKER:
+        if marker in stripped:
+            _, rest = stripped.split("|", 1)
+            return f"{indent}{label} | {rest.lstrip()}"
+    return line
+
+
+def repair_report_mojibake(report: str) -> str:
+    repaired_lines: list[str] = []
+    for line in report.splitlines():
+        repaired = line
+        if _looks_like_mojibake(line):
+            try:
+                repaired = line.encode("gb18030").decode("utf-8")
+            except UnicodeError:
+                repaired = line.encode("gb18030", errors="replace").decode("utf-8", errors="replace")
+            repaired = (
+                repaired
+                .replace("汇��?", "汇总")
+                .replace("总结�?", "总结果")
+                .replace("检查?", "检查")
+                .replace("结论?", "结论")
+                .replace("阈值?", "阈值")
+            )
+        repaired_lines.append(_replace_report_label_from_marker(repaired))
+    return "\n".join(repaired_lines) + ("\n" if report.endswith("\n") else "")
+
+
 def write_receding_recording_log(
     frame_path: Path,
     profile: BrandProfile,
@@ -1983,8 +2535,156 @@ def write_receding_recording_log(
         log_path = frame_path.parent / f"{base_name}_{suffix}.log"
         suffix += 1
 
-    log_path.write_text(report, encoding="utf-8")
+    log_path.write_text(repair_report_mojibake(report), encoding="utf-8-sig")
     return log_path
+
+
+def build_approaching_recording_report(
+    frame_path: Path,
+    profile: BrandProfile,
+    selection: Selection,
+    scenario: Mapping[str, Any],
+    tracks: list[Mapping[str, Any]],
+    point_count_summary: Mapping[str, Any],
+    alarm_summary: Mapping[str, Any],
+    track_build_result: Mapping[str, Any] | None = None,
+) -> str:
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
+    angle_tolerance = dynamic_angle_tolerance(scenario)
+    lines = [
+        "=" * 60,
+        "目标接近分析 | Approaching Target Analysis",
+        "=" * 60,
+        f"生成时间 | Generated at: {generated_at}",
+        f"点云文件 | Frame file: {frame_path.name}",
+        f"点云目录 | Frame directory: {frame_path.parent}",
+        f"车型配置 | Profile: {profile.key}",
+        f"场景编号 | Scenario ID: {selection_tag(selection)}",
+        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
+        "判定说明 | Criteria: 接近动态目标轨迹摘要 | approaching dynamic target track summary",
+        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
+        "点云数量检查 | Point-count check: 点云数量应等于虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
+    ]
+
+    if not tracks:
+        lines.append("[警告/WARN] 未找到符合条件的接近目标周期 | No approaching target cycles found.")
+        return "\n".join(lines) + "\n"
+
+    build_cycles = {
+        cycle["cycle_index"]: cycle
+        for cycle in (track_build_result or {}).get("cycle_results", [])
+    }
+    for idx, track in enumerate(tracks, 1):
+        build_cycle = build_cycles.get(idx, {})
+        object_summary = build_cycle.get("object_summary") or {}
+        build_frame_count = build_cycle.get("build_frame_count")
+        build_frame_text = f"{build_frame_count}" if build_frame_count is not None else "N/A"
+        build_distance = object_summary.get("object_build_distance_m")
+        last_object_distance = object_summary.get("object_last_distance_m")
+        build_distance_text = f"{build_distance}m" if build_distance is not None else "N/A"
+        last_object_distance_text = f"{last_object_distance}m" if last_object_distance is not None else "N/A"
+        lines.append(
+            f"周期#{idx} | Cycle #{idx}: frames={track['first_frame']}-{track['last_frame']} "
+            f"(loss_frame={track['loss_frame']}), detections={track['detections']}, "
+            f"start_range={track['start_range_m']}m, closest_range={track['closest_range_m']}m, "
+            f"min_range={track['min_range_m']}m, object_build_frame={object_summary.get('object_build_frame')}, "
+            f"object_build_time={build_frame_text} frame(s), object_build_distance={build_distance_text}, "
+            f"object_last_frame={object_summary.get('object_last_frame')}, object_last_distance={last_object_distance_text}, "
+            f"avg_velocity={track['avg_velocity']}m/s, avg_angle_az={track['avg_angle_az']}deg, "
+            f"lateral_status={track['lateral_status']}"
+        )
+
+    stable_tracks = [track for track in tracks if track["lateral_status"] == "stable"]
+    unstable_tracks = [track for track in tracks if track["lateral_status"] != "stable"]
+    if stable_tracks and not unstable_tracks:
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期未发生左右跨线 | all detected cycles stay on one side of the center line.")
+    elif stable_tracks:
+        lines.append(
+            "横向稳定性结论 | Lateral stability summary: 结果混合 | mixed results, "
+            f"{len(stable_tracks)} stable cycle(s), {len(unstable_tracks)} unstable cycle(s)."
+        )
+    else:
+        lines.append("横向稳定性结论 | Lateral stability summary: 所有周期都发生左右跨线 | all detected cycles cross the center line from left to right or right to left.")
+    lines.append(f"横向稳定性判定逻辑 | Lateral stability criteria: {LATERAL_STABILITY_CRITERIA}")
+    lines.append(
+        f"点云数量检查结果 | Point-count check result: expected={point_count_summary['expected_point_count']}, "
+        f"observed_min={point_count_summary['observed_min_point_count']}, observed_max={point_count_summary['observed_max_point_count']} "
+        f"-> {'PASS' if point_count_summary['point_count_pass'] else 'FAIL'}"
+    )
+    if point_count_summary["longest_point_count_mismatch_run"]:
+        start_frame, end_frame, run_length = point_count_summary["longest_point_count_mismatch_run"]
+        lines.append(
+            f"最长点云数量异常区间 | Longest point-count mismatch run: {start_frame}-{end_frame} ({run_length} frames)"
+        )
+    lines.append(f"报警事件数 | Alarm event count: {alarm_summary['alarm_event_count']}")
+    lines.append("报警详情 | Alarm details: see the separate approaching_alarm_analysis log file.")
+    return "\n".join(lines) + "\n"
+
+
+def build_approaching_alarm_report(
+    frame_path: Path,
+    profile: BrandProfile,
+    selection: Selection,
+    scenario: Mapping[str, Any],
+    alarm_continuity_result: Mapping[str, Any],
+) -> str:
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 60,
+        "报警详情分析 | Alarm Detail Analysis",
+        "=" * 60,
+        f"生成时间 | Generated at: {generated_at}",
+        f"点云文件 | Frame file: {frame_path.name}",
+        f"点云目录 | Frame directory: {frame_path.parent}",
+        f"车型配置 | Profile: {profile.key}",
+        f"场景编号 | Scenario ID: {selection_tag(selection)}",
+        f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
+        "判定说明 | Criteria: 报警一旦开始，直到 object 消失前必须逐帧连续出现；任何漏报帧都算 FAIL。",
+        f"报警连续性总结果 | Alarm continuity overall: segments={alarm_continuity_result.get('alarm_segment_count', 0)}, "
+        f"missing_alarm_frames={alarm_continuity_result.get('missing_alarm_frame_count', 0)} "
+        f"-> {'PASS' if alarm_continuity_result.get('alarm_continuity_pass') else 'FAIL'}",
+    ]
+
+    if not alarm_continuity_result.get("cycle_results"):
+        lines.append("[警告/WARN] 未找到报警连续性周期 | No alarm continuity cycles found.")
+        return "\n".join(lines) + "\n"
+
+    for cycle in alarm_continuity_result.get("cycle_results", []):
+        first_alarm_frame = cycle.get("first_alarm_frame")
+        first_alarm_text = first_alarm_frame if first_alarm_frame is not None else "N/A"
+        lines.append(
+            f"报警连续性周期 | Alarm continuity cycle #{cycle['cycle_index']}: "
+            f"track_frames={cycle.get('first_frame')}-{cycle.get('last_frame')}, "
+            f"loss_frame={cycle.get('loss_frame')}, first_alarm_frame={first_alarm_text}, "
+            f"check_until_frame={cycle.get('last_track_frame')}, "
+            f"expected_alarm_frames={cycle.get('expected_alarm_frame_count')}, "
+            f"observed_alarm_frames={cycle.get('observed_alarm_frame_count')}, "
+            f"missing_alarm_frames={cycle.get('missing_alarm_frame_count')} "
+            f"-> {'PASS' if cycle.get('continuous_alarm_pass') else 'FAIL'}"
+        )
+        for segment in cycle.get("alarm_segments", []):
+            lines.append(
+                f"报警详情区间 | Alarm detail segment: cycle={cycle['cycle_index']}, "
+                f"type={segment['alarm_type']} ({segment['alarm_label']}), "
+                f"frames={segment['start_frame']}-{segment['end_frame']} ({segment['frame_count']} frames), "
+                f"start_distance={segment['start_distance_m']}m, end_distance={segment['end_distance_m']}m, "
+                f"min_distance={segment['min_distance_m']}m, max_distance={segment['max_distance_m']}m, "
+                f"velocity={segment['min_velocity_mps']}~{segment['max_velocity_mps']}m/s"
+            )
+        for missing_run in cycle.get("missing_alarm_runs", []):
+            missing_frames = ",".join(str(frame_idx) for frame_idx in missing_run.get("frame_indices", []))
+            lines.append(
+                f"应报警未报警帧 | Missing required alarm frames: cycle={cycle['cycle_index']}, "
+                f"frames={missing_run['start_frame']}-{missing_run['end_frame']} [{missing_frames}], "
+                f"expected_alarm={missing_run.get('expected_alarm_type')} ({missing_run.get('expected_alarm_label')}), "
+                f"missing_count={len(missing_run.get('frame_indices', []))}, "
+                f"distance={missing_run.get('min_distance_m')}~{missing_run.get('max_distance_m')}m, "
+                f"velocity={missing_run.get('min_velocity_mps')}~{missing_run.get('max_velocity_mps')}m/s"
+            )
+
+    return "\n".join(lines) + "\n"
 
 
 def analyze_receding_recording(
@@ -2042,7 +2742,7 @@ def analyze_receding_recording(
     report = append_point_continuity_summary(report, continuity_result)
     report = append_distance_error_summary(report, distance_error_result)
     report = replace_overall_result(report, result["overall_pass"])
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(frame_path, profile, selection, report)
     print(f"[INFO] Saved max-distance log: {log_path}")
     return log_path
@@ -2054,7 +2754,12 @@ def analyze_approaching_recording(
     selection: Selection,
     scenario: Mapping[str, Any],
 ) -> Path:
-    from detect_loss import analyze_expected_point_count, find_approaching_target_tracks, parse_frames, summarize_alarm_events_for_tracks
+    from detect_loss import (
+        analyze_expected_point_count,
+        find_approaching_target_tracks,
+        parse_frames,
+        summarize_alarm_events_for_tracks,
+    )
 
     frames = parse_frames(frame_path)
     angle_tolerance = dynamic_angle_tolerance(scenario)
@@ -2073,6 +2778,16 @@ def analyze_approaching_recording(
     )
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
+    alarm_continuity_result = evaluate_approaching_alarm_continuity(tracks, frames) if tracks else {
+        "cycle_results": [],
+        "alarm_continuity_pass": False,
+        "missing_alarm_frame_count": 0,
+        "alarm_segment_count": 0,
+    }
+    main_alarm_summary = {
+        "alarm_events": [],
+        "alarm_event_count": alarm_summary.get("alarm_event_count", 0),
+    }
     track_build_result = evaluate_dynamic_track_build(
         tracks,
         frame_limit=dynamic_track_build_frame_limit(scenario),
@@ -2092,7 +2807,7 @@ def analyze_approaching_recording(
         scenario,
         tracks,
         point_count_summary,
-        alarm_summary,
+        main_alarm_summary,
         track_build_result,
     )
     report = append_approaching_complete_cycle_summary(report, track_build_result)
@@ -2107,11 +2822,12 @@ def analyze_approaching_recording(
         and continuity_result["no_three_frame_loss_pass"]
         and distance_error_result["longitudinal_pass"]
         and distance_error_result["velocity_pass"]
+        and alarm_continuity_result["alarm_continuity_pass"]
     )
     if distance_error_result["lateral_pass"] is not None:
         approaching_overall_pass = approaching_overall_pass and distance_error_result["lateral_pass"]
     report = replace_overall_result(report, approaching_overall_pass)
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(
         frame_path,
         profile,
@@ -2120,6 +2836,15 @@ def analyze_approaching_recording(
         prefix="approaching_target_analysis",
     )
     print(f"[INFO] Saved approaching-target log: {log_path}")
+    alarm_report = build_approaching_alarm_report(frame_path, profile, selection, scenario, alarm_continuity_result)
+    alarm_log_path = write_receding_recording_log(
+        frame_path,
+        profile,
+        selection,
+        alarm_report,
+        prefix="approaching_alarm_analysis",
+    )
+    print(f"[INFO] Saved approaching-alarm log: {alarm_log_path}")
     return log_path
 
 
@@ -2214,7 +2939,7 @@ def analyze_fixed_recording(
     report = append_point_continuity_summary(report, continuity_result, label="target")
     report = append_distance_error_summary(report, distance_error_result)
     report = replace_overall_result(report, result["overall_pass"])
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(
         frame_path,
         profile,
@@ -2321,13 +3046,12 @@ def analyze_m1_resolution(
             report,
             search_warnings
             + [
-                "[警告/ WARN] 二分搜索的所有录制样本都未识别到两个 Object 目标，已输出失败日志。"
-                " | No recording sample in the binary search resolved two Object targets; failure log generated."
+                "[WARN] No recording sample in the binary search resolved two Object targets; failure log generated."
             ],
         )
         report = replace_overall_result(report, False)
         print()
-        print(report, end="")
+        print(console_safe_text(report), end="")
         log_path = write_receding_recording_log(
             best_frame_path,
             profile,
@@ -2369,7 +3093,7 @@ def analyze_m1_resolution(
         report = insert_lines_before_overall(report, search_warnings)
     report = replace_overall_result(report, result["overall_pass"])
     print()
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(
         best_frame_path,
         profile,
@@ -2476,13 +3200,12 @@ def analyze_m2_speed_resolution(
             report,
             search_warnings
             + [
-                "[警告/ WARN] 二分搜索的所有录制样本都未识别到两个 Object 目标，已输出失败日志。"
-                " | No recording sample in the binary search resolved two Object targets; failure log generated."
+                "[WARN] No recording sample in the binary search resolved two Object targets; failure log generated."
             ],
         )
         report = replace_overall_result(report, False)
         print()
-        print(report, end="")
+        print(console_safe_text(report), end="")
         log_path = write_receding_recording_log(
             best_frame_path,
             profile,
@@ -2524,7 +3247,7 @@ def analyze_m2_speed_resolution(
         report = insert_lines_before_overall(report, search_warnings)
     report = replace_overall_result(report, result["overall_pass"])
     print()
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(
         best_frame_path,
         profile,
@@ -2580,7 +3303,7 @@ def analyze_speed_sweep_recording(
     report = append_point_continuity_summary(report, continuity_result, label="target")
     report = append_distance_error_summary(report, distance_error_result)
     report = replace_overall_result(report, result["overall_pass"])
-    print(report, end="")
+    print(console_safe_text(report), end="")
     log_path = write_receding_recording_log(
         frame_path,
         profile,

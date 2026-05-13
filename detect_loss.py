@@ -879,6 +879,219 @@ def _predict_track_object(track, frames, frame_idx, range_tolerance=4.0, velocit
     return candidates[0][2]
 
 
+def _alarm_type_label(alarm_type):
+    return {
+        0: "no alarm",
+        1: "left",
+        2: "right",
+        3: "rear",
+    }.get(alarm_type, f"unknown-{alarm_type}")
+
+
+def _compress_frame_ranges(frame_indices):
+    if not frame_indices:
+        return []
+
+    ranges = []
+    start = prev = frame_indices[0]
+    for frame_idx in frame_indices[1:]:
+        if frame_idx == prev + 1:
+            prev = frame_idx
+            continue
+        ranges.append((start, prev))
+        start = prev = frame_idx
+    ranges.append((start, prev))
+    return ranges
+
+
+def summarize_approaching_alarm_continuity(
+    track,
+    frames,
+    range_tolerance=4.0,
+    velocity_tolerance=3.0,
+):
+    items = sorted(track.get("items", []), key=lambda item: item.get("frame_idx", 0))
+    if not items:
+        return {
+            "alarm_segments": [],
+            "missing_alarm_runs": [],
+            "first_alarm_frame": None,
+            "last_track_frame": None,
+            "expected_alarm_frame_count": 0,
+            "observed_alarm_frame_count": 0,
+            "missing_alarm_frame_count": 0,
+            "continuous_alarm_pass": False,
+        }
+
+    start_frame = items[0]["frame_idx"]
+    end_frame = track.get("loss_frame")
+    if end_frame is not None:
+        end_frame = max(start_frame, end_frame - 1)
+    else:
+        end_frame = items[-1]["frame_idx"]
+
+    first_alarm_frame = None
+    expected_alarm_frames = []
+    observed_alarm_frames = []
+    missing_alarm_runs = []
+    alarm_segments = []
+    current_segment = None
+    current_missing_run = None
+    last_active_alarm_type = None
+
+    for frame_idx in range(start_frame, end_frame + 1):
+        frame = frames[frame_idx - 1] if 1 <= frame_idx <= len(frames) else None
+        alarm_type = frame.get("alarm_type", 0) if frame is not None else 0
+        best_object = _predict_track_object(
+            track,
+            frames,
+            frame_idx,
+            range_tolerance=range_tolerance,
+            velocity_tolerance=velocity_tolerance,
+        )
+        point = None
+        if best_object is None:
+            for item in items:
+                if item.get("frame_idx") == frame_idx:
+                    point = item.get("point")
+                    break
+        distance_m = None
+        velocity_mps = None
+        if best_object is not None:
+            distance_m = round(best_object.dist_long, 2)
+            velocity_mps = round(best_object.vre_long, 2)
+        elif point is not None:
+            distance_m = round(point.range_m, 2)
+            velocity_mps = round(point.velocity, 2)
+
+        if alarm_type != 0:
+            expected_alarm_frames.append(frame_idx)
+            observed_alarm_frames.append(frame_idx)
+            if first_alarm_frame is None:
+                first_alarm_frame = frame_idx
+            if current_missing_run is not None:
+                missing_alarm_runs.append(current_missing_run)
+                current_missing_run = None
+            if current_segment is None or current_segment["alarm_type"] != alarm_type:
+                if current_segment is not None:
+                    alarm_segments.append(current_segment)
+                current_segment = {
+                    "alarm_type": alarm_type,
+                    "alarm_label": _alarm_type_label(alarm_type),
+                    "start_frame": frame_idx,
+                    "end_frame": frame_idx,
+                    "start_distance_m": distance_m,
+                    "end_distance_m": distance_m,
+                    "min_distance_m": distance_m,
+                    "max_distance_m": distance_m,
+                    "start_velocity_mps": velocity_mps,
+                    "end_velocity_mps": velocity_mps,
+                    "min_velocity_mps": velocity_mps,
+                    "max_velocity_mps": velocity_mps,
+                    "frame_count": 1,
+                }
+            else:
+                current_segment["end_frame"] = frame_idx
+                current_segment["end_distance_m"] = distance_m
+                current_segment["end_velocity_mps"] = velocity_mps
+                current_segment["frame_count"] += 1
+            if distance_m is not None:
+                current_segment["min_distance_m"] = (
+                    distance_m
+                    if current_segment["min_distance_m"] is None
+                    else min(current_segment["min_distance_m"], distance_m)
+                )
+                current_segment["max_distance_m"] = (
+                    distance_m
+                    if current_segment["max_distance_m"] is None
+                    else max(current_segment["max_distance_m"], distance_m)
+                )
+            if velocity_mps is not None:
+                current_segment["min_velocity_mps"] = (
+                    velocity_mps
+                    if current_segment["min_velocity_mps"] is None
+                    else min(current_segment["min_velocity_mps"], velocity_mps)
+                )
+                current_segment["max_velocity_mps"] = (
+                    velocity_mps
+                    if current_segment["max_velocity_mps"] is None
+                    else max(current_segment["max_velocity_mps"], velocity_mps)
+                )
+            last_active_alarm_type = alarm_type
+            continue
+
+        if first_alarm_frame is None:
+            continue
+
+        expected_alarm_frames.append(frame_idx)
+        if current_segment is not None:
+            alarm_segments.append(current_segment)
+            current_segment = None
+
+        if current_missing_run is None:
+            current_missing_run = {
+                "start_frame": frame_idx,
+                "end_frame": frame_idx,
+                "frame_indices": [frame_idx],
+                "expected_alarm_type": last_active_alarm_type,
+                "expected_alarm_label": _alarm_type_label(last_active_alarm_type) if last_active_alarm_type is not None else "unknown",
+                "start_distance_m": distance_m,
+                "end_distance_m": distance_m,
+                "min_distance_m": distance_m,
+                "max_distance_m": distance_m,
+                "start_velocity_mps": velocity_mps,
+                "end_velocity_mps": velocity_mps,
+                "min_velocity_mps": velocity_mps,
+                "max_velocity_mps": velocity_mps,
+            }
+        else:
+            current_missing_run["end_frame"] = frame_idx
+            current_missing_run["frame_indices"].append(frame_idx)
+            current_missing_run["end_distance_m"] = distance_m
+            current_missing_run["end_velocity_mps"] = velocity_mps
+            if distance_m is not None:
+                current_missing_run["min_distance_m"] = (
+                    distance_m
+                    if current_missing_run["min_distance_m"] is None
+                    else min(current_missing_run["min_distance_m"], distance_m)
+                )
+                current_missing_run["max_distance_m"] = (
+                    distance_m
+                    if current_missing_run["max_distance_m"] is None
+                    else max(current_missing_run["max_distance_m"], distance_m)
+                )
+            if velocity_mps is not None:
+                current_missing_run["min_velocity_mps"] = (
+                    velocity_mps
+                    if current_missing_run["min_velocity_mps"] is None
+                    else min(current_missing_run["min_velocity_mps"], velocity_mps)
+                )
+                current_missing_run["max_velocity_mps"] = (
+                    velocity_mps
+                    if current_missing_run["max_velocity_mps"] is None
+                    else max(current_missing_run["max_velocity_mps"], velocity_mps)
+                )
+
+    if current_segment is not None:
+        alarm_segments.append(current_segment)
+    if current_missing_run is not None:
+        missing_alarm_runs.append(current_missing_run)
+
+    expected_alarm_frame_count = max(0, end_frame - first_alarm_frame + 1) if first_alarm_frame is not None else 0
+    missing_alarm_frame_count = sum(len(run["frame_indices"]) for run in missing_alarm_runs)
+
+    return {
+        "alarm_segments": alarm_segments,
+        "missing_alarm_runs": missing_alarm_runs,
+        "first_alarm_frame": first_alarm_frame,
+        "last_track_frame": end_frame,
+        "expected_alarm_frame_count": expected_alarm_frame_count,
+        "observed_alarm_frame_count": expected_alarm_frame_count - missing_alarm_frame_count if first_alarm_frame is not None else 0,
+        "missing_alarm_frame_count": missing_alarm_frame_count,
+        "continuous_alarm_pass": first_alarm_frame is not None and missing_alarm_frame_count == 0,
+    }
+
+
 def summarize_alarm_events_for_track_objects(track, range_tolerance=4.0, velocity_tolerance=3.0):
     alarm_labels = {
         0: "no alarm",

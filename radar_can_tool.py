@@ -13,7 +13,7 @@ import win32process
 from pywinauto import Application, Desktop, keyboard
 
 
-EXE_PATH = r"D:\Kawhi\Tools\Quectel_Radar_AM100AA-MT_Tool_V1.1.8.3_\Quectel_Radar_AM100AA-MT_Tool_V1.1.8.3\Quectel_Radar_AM100AA-MT_Tool_V1.1.8.3.exe"
+EXE_PATH = r"D:\Kawhi\Tools\Quectel_Radar_AM100AA-MT_Tool_V1.2\Quectel_Radar_AM100AA-MT_Tool_V1.2.exe"
 EXE_NAME = os.path.basename(EXE_PATH)
 
 
@@ -115,26 +115,61 @@ def wait_for_can_window(pid, main_hwnd, timeout=10):
     return None
 
 
-def confirm_point_cloud_only_recording(main_title="AM100AA-MT_V1.1", timeout=5):
+def _window_texts(window):
+    texts = []
+    try:
+        title = window.window_text()
+        if title:
+            texts.append(title)
+    except Exception:
+        pass
+    try:
+        for item in window.descendants(control_type="Text"):
+            text = item.window_text()
+            if text:
+                texts.append(text)
+    except Exception:
+        pass
+    return texts
+
+
+def _is_point_cloud_only_prompt(window):
+    text = "\n".join(_window_texts(window))
+    lowered = text.lower()
+    return (
+        ("摄像头未打开" in text or "camera" in lowered)
+        and ("仅录制点云" in text or "点云数据" in text or "point" in lowered)
+    )
+
+
+def _click_yes_button(window):
+    yes_titles = {"Yes", "&Yes", "是", "确定", "OK"}
+    for button in window.descendants(control_type="Button"):
+        try:
+            title = button.window_text().strip()
+            if title in yes_titles:
+                button.click_input()
+                return True
+        except Exception:
+            continue
+    try:
+        keyboard.send_keys("{ENTER}")
+        return True
+    except Exception:
+        return False
+
+
+def confirm_point_cloud_only_recording(timeout=5):
     deadline = time.time() + timeout
     while time.time() < deadline:
         for window in Desktop(backend="uia").windows():
             try:
-                if window.window_text() != main_title:
+                if not _is_point_cloud_only_prompt(window):
                     continue
 
-                has_camera_prompt = any(
-                    "当前摄像头未打开" in item.window_text()
-                    for item in window.descendants(control_type="Text")
-                )
-                if not has_camera_prompt:
-                    continue
-
-                for button in window.descendants(control_type="Button"):
-                    if button.window_text() == "Yes":
-                        print("[INFO] Camera prompt detected; clicking Yes...")
-                        button.click_input()
-                        return True
+                print("[INFO] Camera prompt detected; clicking Yes...")
+                if _click_yes_button(window):
+                    return True
             except Exception:
                 continue
         time.sleep(0.2)
