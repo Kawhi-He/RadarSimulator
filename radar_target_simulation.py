@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import math
 import re
 import threading
@@ -210,6 +211,49 @@ def dynamic_angle_tolerance(scenario: Mapping[str, Any], default: float = 0.25) 
     if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
         raise ValueError("dynamic_angle_tolerance must be a non-negative number")
     return float(value)
+
+
+def dynamic_target_angle(scenario: Mapping[str, Any]) -> float:
+    return float(scenario.get("angle", 0.0))
+
+
+def _candidate_dynamic_angle_centers(
+    frames,
+    *,
+    target_speed: float,
+    velocity_tolerance: float,
+    range_predicate,
+    angle_bin_size: float = 0.1,
+) -> list[float]:
+    centers: set[float] = set()
+    for frame in frames:
+        for point in frame.get("points", []):
+            if abs(point.velocity - target_speed) <= velocity_tolerance and range_predicate(point.range_m):
+                centers.add(round(round(point.angle_az / angle_bin_size) * angle_bin_size, 6))
+    centers.discard(0.0)
+    return sorted(centers)
+
+
+def _select_angle_centered_tracks(
+    finder,
+    frames,
+    *,
+    candidate_centers: list[float],
+    finder_kwargs: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], float | None]:
+    best_tracks: list[Mapping[str, Any]] = []
+    best_center: float | None = None
+    best_score: tuple[int, int, float] | None = None
+    for center in candidate_centers:
+        tracks = finder(frames, target_angle=center, **finder_kwargs)
+        if not tracks:
+            continue
+        score = (sum(track["detections"] for track in tracks), len(tracks), -abs(center))
+        if best_score is None or score > best_score:
+            best_tracks = tracks
+            best_center = center
+            best_score = score
+    return best_tracks, best_center
 
 
 def scenario_longitudinal_tolerance(scenario: Mapping[str, Any]) -> float:
@@ -558,9 +602,10 @@ def evaluate_dynamic_distance_errors(
         lateral_tolerance,
         velocity_tolerance,
     )
+    angle_source = scenario.get("dynamic_angle_source", "configured" if "angle" in scenario else "default")
     summary["expected_model"] = (
         "dynamic: expected longitudinal distance = first matched target range + configured speed * 0.1s * frame gap; "
-        "expected lateral distance comes from configured angle, default 0m."
+        f"expected lateral distance comes from AngleAZ center {configured_angle} ({angle_source})."
     )
     return summary
 
@@ -1341,6 +1386,8 @@ def build_receding_recording_report(
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     angle_tolerance = dynamic_angle_tolerance(scenario)
+    target_angle = dynamic_target_angle(scenario)
+    angle_source = scenario.get("dynamic_angle_source", "configured" if "angle" in scenario else "default")
     lines = [
         "=" * 60,
         "鐩爣杩滅涓㈠け鍒嗘瀽 | Receding Target Loss Analysis",
@@ -1352,7 +1399,7 @@ def build_receding_recording_report(
         f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
         f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
         "鍒ゅ畾鏉′欢 | Criteria: 杩滅鍔ㄦ€佺洰鏍囷紝杩炵画3甯ф湭妫€鍑哄垽瀹氫负涓㈠け | receding dynamic target, loss = 3 consecutive missed frames",
-        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ center={target_angle}rad ({angle_source}), tolerance=+/-{angle_tolerance}rad",
         f"寤鸿埅鏃堕棿妫€鏌?| Track-build check: 鐐逛簯棣栨鍑虹幇鍚?{track_build_frame_limit} 甯у唴搴旂敓鎴?object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "鐐逛簯鏁伴噺妫€鏌?| Point-count check: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
     ]
@@ -1833,6 +1880,8 @@ def build_approaching_recording_report(
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     angle_tolerance = dynamic_angle_tolerance(scenario)
+    target_angle = dynamic_target_angle(scenario)
+    angle_source = scenario.get("dynamic_angle_source", "configured" if "angle" in scenario else "default")
     lines = [
         "=" * 60,
         "鐩爣鎺ヨ繎鍒嗘瀽 | Approaching Target Analysis",
@@ -1844,7 +1893,7 @@ def build_approaching_recording_report(
         f"鍦烘櫙缂栧彿 | Scenario ID: {selection_tag(selection)}",
         f"鍦烘櫙璇存槑 | Scenario: {scenario.get('desc', 'N/A')}",
         "鍒ゅ畾璇存槑 | Criteria: 鎺ヨ繎鍔ㄦ€佺洰鏍囪建杩规憳瑕?| approaching dynamic target track summary",
-        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"鍔ㄦ€佺偣鍖归厤 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ center={target_angle}rad ({angle_source}), tolerance=+/-{angle_tolerance}rad",
         f"寤鸿埅鏃堕棿妫€鏌?| Track-build check: 鐐逛簯棣栨鍑虹幇鍚?{track_build_frame_limit} 甯у唴搴旂敓鎴?object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "鐐逛簯鏁伴噺妫€鏌?| Point-count check: 鐐逛簯鏁伴噺搴旂瓑浜?铏氭嫙鐩爣鏁?+ 1 涓噾灞炵洰鏍?| point count should equal virtual target count + 1 metal target",
     ]
@@ -2513,6 +2562,684 @@ def repair_report_mojibake(report: str) -> str:
     return "\n".join(repaired_lines) + ("\n" if report.endswith("\n") else "")
 
 
+def _extract_status(line: str) -> str | None:
+    if re.search(r"\bFAIL\b", line):
+        return "FAIL"
+    if re.search(r"\bPASS\b", line):
+        return "PASS"
+    return None
+
+
+def _line_label(line: str) -> str:
+    if " | " in line:
+        return line.split(" | ", 1)[0].strip()
+    if ":" in line:
+        return line.split(":", 1)[0].strip()
+    return line.strip()
+
+
+def _is_summary_status_line(line: str) -> bool:
+    if _extract_status(line) is None:
+        return False
+    lowered = line.lower()
+    if "criteria:" in lowered or "判定说明" in line:
+        return False
+    detail_markers = (
+        "cycle #",
+        "周期#",
+        "distance error sample",
+        "max longitudinal error detail",
+        "max lateral error detail",
+        "max velocity error detail",
+        "max angle bias detail",
+        "missing required alarm frames",
+        "alarm detail segment",
+    )
+    if any(marker in lowered for marker in detail_markers):
+        return False
+    return True
+
+
+def _related_detail_lines(item: Mapping[str, Any], detail_lines: list[str]) -> list[str]:
+    label = str(item.get("label", ""))
+    line = str(item.get("line", ""))
+    haystack = f"{label} {line}"
+    rules: list[str] = []
+    if "点云数量" in haystack or "Point-count" in haystack:
+        rules = ["最长点云数量异常区间", "Longest point-count mismatch run"]
+    elif "建航时间" in haystack or "Track-build" in haystack:
+        rules = ["建航时间明细", "Track-build details", "Track-build cycle"]
+    elif "点云连续性" in haystack or "连续3帧" in haystack or "Point-cloud continuity" in haystack or "3-frame loss" in haystack:
+        rules = ["点云连续性明细", "Point-cloud continuity"]
+    elif "纵向距离误差" in haystack or "Longitudinal distance error" in haystack:
+        rules = ["最大纵向误差位置", "Max longitudinal error detail", "距离误差判定逻辑", "Distance error model", "距离误差样例", "Distance error sample"]
+    elif "横向距离误差" in haystack or "Lateral distance error" in haystack:
+        rules = ["最大横向误差位置", "Max lateral error detail", "距离误差判定逻辑", "Distance error model", "距离误差样例", "Distance error sample"]
+    elif "速度误差" in haystack or "Velocity error" in haystack:
+        rules = ["最大速度误差位置", "Max velocity error detail"]
+    elif "角度" in haystack or "Angle" in haystack:
+        rules = ["最大角度偏差位置", "Max angle bias detail"]
+    elif "报警" in haystack or "Alarm" in haystack:
+        rules = ["报警连续性周期", "报警详情区间", "应报警未报警帧", "Alarm continuity cycle", "Alarm detail segment", "Missing required alarm frames"]
+    elif "Overall result" in haystack or "最终结论" in haystack:
+        rules = []
+
+    if not rules:
+        return []
+    return [detail for detail in detail_lines if any(rule in detail for rule in rules)]
+
+
+def _parse_report_for_html(report: str) -> dict[str, Any]:
+    lines = [line.rstrip() for line in report.splitlines() if line.strip() and set(line.strip()) != {"="}]
+    title = lines[0] if lines else "Radar Test Report"
+    metadata: list[tuple[str, str]] = []
+    summary_items: list[dict[str, Any]] = []
+    detail_lines: list[str] = []
+    current_item: dict[str, Any] | None = None
+    collecting_metadata = True
+
+    for line in lines[1:]:
+        is_summary_status = _is_summary_status_line(line)
+        if collecting_metadata and " | " in line and ":" in line and _extract_status(line) is None and not line.startswith(("周期#", "  ")):
+            key, value = line.split(":", 1)
+            metadata.append((key.strip(), value.strip()))
+        if is_summary_status:
+            collecting_metadata = False
+            current_item = {
+                "status": _extract_status(line) or "",
+                "label": _line_label(line),
+                "line": line,
+                "details": [],
+            }
+            summary_items.append(current_item)
+        else:
+            detail_lines.append(line)
+            if current_item is not None:
+                current_item["details"].append(line)
+
+    for item in summary_items:
+        related_details = _related_detail_lines(item, detail_lines)
+        if related_details:
+            item["details"] = related_details
+
+    lateral_stability_item = _extract_lateral_stability_summary_item(report)
+    if lateral_stability_item is not None:
+        overall_idx = next(
+            (idx for idx, item in enumerate(summary_items) if "Overall result" in str(item.get("line", ""))),
+            None,
+        )
+        if overall_idx is None:
+            summary_items.append(lateral_stability_item)
+        else:
+            summary_items.insert(overall_idx, lateral_stability_item)
+
+    overall = next((item for item in reversed(summary_items) if "Overall result" in item["line"]), None)
+    return {
+        "title": title,
+        "metadata": metadata[:8],
+        "summary_items": summary_items,
+        "detail_lines": detail_lines,
+        "overall_status": overall["status"] if overall else (_extract_status(report) or "UNKNOWN"),
+    }
+
+
+def _format_metric_number(value: float) -> str:
+    text = f"{value:.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _extract_receding_overview_metrics(report: str) -> list[tuple[str, str]]:
+    farthest_loss_distance: str | None = None
+    average_loss_distance: str | None = None
+
+    for line in report.splitlines():
+        if "Farthest loss distance across cycles:" in line:
+            match = re.search(r"Farthest loss distance across cycles:\s*([0-9.]+m)", line)
+            if match:
+                farthest_loss_distance = match.group(1)
+        elif "Loss distance per cycle:" in line:
+            values = [float(value) for value in re.findall(r"([0-9]+(?:\.[0-9]+)?)m", line)]
+            if values:
+                average_loss_distance = f"{_format_metric_number(sum(values) / len(values))}m"
+
+    metrics: list[tuple[str, str]] = []
+    if farthest_loss_distance is not None:
+        metrics.append(("最远丢失距离", farthest_loss_distance))
+    if average_loss_distance is not None:
+        metrics.append(("平均最远丢失距离", average_loss_distance))
+    return metrics
+
+
+def _extract_common_overview_metrics(report: str) -> list[tuple[str, str]]:
+    cycle_count: int | None = None
+    alarm_event_count: str | None = None
+    angle_bias_summary: str | None = None
+    cycle_indices: set[int] = set()
+    alarm_cycle_indices: set[int] = set()
+
+    for line in report.splitlines():
+        if "lateral_status=" in line and "Cycle #" in line:
+            match = re.search(r"Cycle #(\d+):", line)
+            if match:
+                cycle_indices.add(int(match.group(1)))
+        elif "Alarm continuity cycle #" in line:
+            match = re.search(r"Alarm continuity cycle #(\d+):", line)
+            if match:
+                alarm_cycle_indices.add(int(match.group(1)))
+        elif "Alarm event count:" in line:
+            match = re.search(r"Alarm event count:\s*(\d+)", line)
+            if match:
+                alarm_event_count = match.group(1)
+        elif "Angle bias estimate:" in line:
+            avg_match = re.search(r"avg_bias=([+-]?[0-9.]+deg)", line)
+            max_match = re.search(r"max_abs_error=([0-9.]+deg)", line)
+            if avg_match and max_match:
+                angle_bias_summary = f"avg {avg_match.group(1)} / max {max_match.group(1)}"
+            elif avg_match:
+                angle_bias_summary = f"avg {avg_match.group(1)}"
+
+    if cycle_indices:
+        cycle_count = len(cycle_indices)
+    elif alarm_cycle_indices:
+        cycle_count = len(alarm_cycle_indices)
+
+    metrics: list[tuple[str, str]] = []
+    if cycle_count is not None:
+        metrics.append(("测试周期数", str(cycle_count)))
+    if alarm_event_count is not None:
+        metrics.append(("报警事件数", alarm_event_count))
+    if angle_bias_summary is not None:
+        metrics.append(("角度偏差", angle_bias_summary))
+    return metrics
+
+
+def _extract_lateral_stability_summary_item(report: str) -> dict[str, Any] | None:
+    cycle_lines: list[str] = []
+    stable_count = 0
+    unstable_count = 0
+    summary_line: str | None = None
+    criteria_line: str | None = None
+
+    for line in report.splitlines():
+        if "Lateral stability summary:" in line:
+            summary_line = line.strip()
+        elif "Lateral stability criteria:" in line:
+            criteria_line = line.strip()
+        elif "lateral_status=" in line and "Cycle #" in line:
+            cycle_lines.append(line.strip())
+            match = re.search(r"lateral_status=([^,\s]+)", line)
+            status = match.group(1).strip().lower() if match else ""
+            if status == "stable":
+                stable_count += 1
+            elif status:
+                unstable_count += 1
+
+    if not cycle_lines:
+        return None
+
+    overall_pass = unstable_count == 0
+    details = cycle_lines.copy()
+    if summary_line is not None:
+        details.append(summary_line)
+    if criteria_line is not None:
+        details.append(criteria_line)
+
+    return {
+        "status": "PASS" if overall_pass else "FAIL",
+        "label": "横向稳定性检查",
+        "line": (
+            "横向稳定性检查 | Lateral-stability check: "
+            f"stable_cycles={stable_count}, unstable_cycles={unstable_count} "
+            f"-> {'PASS' if overall_pass else 'FAIL'}"
+        ),
+        "details": details,
+    }
+
+
+def _extract_alarm_cycle_summary(report: str) -> list[dict[str, Any]]:
+    cycles: dict[int, dict[str, Any]] = {}
+
+    for line in report.splitlines():
+        if "Alarm continuity cycle #" in line:
+            match = re.search(
+                r"Alarm continuity cycle #(\d+):.*?track_frames=([^,]+),.*?first_alarm_frame=([^,]+),"
+                r".*?missing_alarm_frames=(\d+)\s*->\s*(PASS|FAIL)",
+                line,
+            )
+            if not match:
+                continue
+            cycle_index = int(match.group(1))
+            cycles[cycle_index] = {
+                "cycle_index": cycle_index,
+                "track_frames": match.group(2).strip(),
+                "first_alarm_frame": match.group(3).strip(),
+                "earliest_alarm_distance": "N/A",
+                "missing_alarm_frames": match.group(4).strip(),
+                "missing_frame_indices": [],
+                "status": match.group(5).strip(),
+            }
+            continue
+
+        if "Alarm detail segment:" in line:
+            match = re.search(
+                r"Alarm detail segment:\s*cycle=(\d+),.*?frames=(\d+)-(\d+)\s+\([^)]*\),\s*"
+                r"start_distance=([0-9.]+m)",
+                line,
+            )
+            if not match:
+                continue
+            cycle_index = int(match.group(1))
+            start_frame = int(match.group(2))
+            start_distance = match.group(4)
+            cycle = cycles.setdefault(
+                cycle_index,
+                {
+                    "cycle_index": cycle_index,
+                    "track_frames": "N/A",
+                    "first_alarm_frame": "N/A",
+                    "earliest_alarm_distance": "N/A",
+                    "missing_alarm_frames": "N/A",
+                    "missing_frame_indices": [],
+                    "status": "UNKNOWN",
+                },
+            )
+            current_first_alarm_frame = cycle.get("first_alarm_frame", "N/A")
+            if current_first_alarm_frame in (None, "N/A"):
+                cycle["first_alarm_frame"] = str(start_frame)
+                cycle["earliest_alarm_distance"] = start_distance
+                continue
+            try:
+                known_first_alarm_frame = int(str(current_first_alarm_frame))
+            except ValueError:
+                known_first_alarm_frame = start_frame
+            if start_frame <= known_first_alarm_frame:
+                cycle["first_alarm_frame"] = str(start_frame)
+                cycle["earliest_alarm_distance"] = start_distance
+            continue
+
+        if "Missing required alarm frames:" in line:
+            match = re.search(
+                r"Missing required alarm frames:\s*cycle=(\d+),.*?\[([0-9,\s]*)\]",
+                line,
+            )
+            if not match:
+                continue
+            cycle_index = int(match.group(1))
+            raw_indices = match.group(2).strip()
+            frame_indices = [
+                int(frame_idx.strip())
+                for frame_idx in raw_indices.split(",")
+                if frame_idx.strip()
+            ]
+            cycle = cycles.setdefault(
+                cycle_index,
+                {
+                    "cycle_index": cycle_index,
+                    "track_frames": "N/A",
+                    "first_alarm_frame": "N/A",
+                    "earliest_alarm_distance": "N/A",
+                    "missing_alarm_frames": str(len(frame_indices)),
+                    "missing_frame_indices": [],
+                    "status": "UNKNOWN",
+                },
+            )
+            existing_indices = {
+                int(frame_idx)
+                for frame_idx in cycle.get("missing_frame_indices", [])
+            }
+            existing_indices.update(frame_indices)
+            cycle["missing_frame_indices"] = sorted(existing_indices)
+
+    return [
+        {
+            "cycle_index": str(cycle["cycle_index"]),
+            "track_frames": str(cycle["track_frames"]),
+            "first_alarm_frame": str(cycle["first_alarm_frame"]),
+            "earliest_alarm_distance": str(cycle["earliest_alarm_distance"]),
+            "missing_alarm_frames": str(cycle["missing_alarm_frames"]),
+            "missing_frame_indices": list(cycle.get("missing_frame_indices", [])),
+            "status": str(cycle["status"]),
+        }
+        for _, cycle in sorted(cycles.items())
+    ]
+
+
+def _status_group_html(summary_items: list[Mapping[str, Any]], status: str, title: str) -> str:
+    items = [item for item in summary_items if item.get("status") == status]
+    if not items:
+        return (
+            f"<section class=\"result-group\"><h2>{html.escape(title)}</h2>"
+            "<p class=\"empty\">没有对应测试项。</p></section>"
+        )
+    cards: list[str] = []
+    for item in items:
+        details = list(item.get("details") or [])
+        detail_text = "\n".join([str(item.get("line", "")), *[str(detail) for detail in details]])
+        detail_count = len(details)
+        cards.append(
+            "<details class=\"case\">"
+            "<summary>"
+            f"<span class=\"status {status.lower()}\">{html.escape(status)}</span>"
+            f"<span class=\"case-title\">{html.escape(str(item.get('label', '')))}</span>"
+            f"<span class=\"case-count\">{detail_count} 条关联日志</span>"
+            "</summary>"
+            f"<pre>{html.escape(detail_text)}</pre>"
+            "</details>"
+        )
+    return f"<section class=\"result-group\"><h2>{html.escape(title)}</h2>{''.join(cards)}</section>"
+
+
+def build_html_report(report: str, log_name: str) -> str:
+    data = _parse_report_for_html(report)
+    summary_items = data["summary_items"]
+    pass_count = sum(1 for item in summary_items if item["status"] == "PASS")
+    fail_count = sum(1 for item in summary_items if item["status"] == "FAIL")
+    overall_status = data["overall_status"]
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    overview_metrics = [
+        ("PASS 项", str(pass_count)),
+        ("FAIL 项", str(fail_count)),
+        ("测试项总数", str(len(summary_items))),
+        *_extract_common_overview_metrics(report),
+        *_extract_receding_overview_metrics(report),
+    ]
+
+    metadata_rows = "\n".join(
+        f"<div class=\"meta-row\"><dt>{html.escape(key)}</dt><dd>{html.escape(value)}</dd></div>"
+        for key, value in data["metadata"]
+    )
+    if not metadata_rows:
+        metadata_rows = "<div class=\"meta-row\"><dt>Log</dt><dd>" + html.escape(log_name) + "</dd></div>"
+
+    row_parts: list[str] = []
+    for item in summary_items:
+        details = list(item.get("details") or [])
+        detail_text = "\n".join(str(detail) for detail in details) if details else "无关联详细log。"
+        detail_count = len(details)
+        row_parts.append(
+            "<tr>"
+            f"<td><span class=\"status {item['status'].lower()}\">{item['status']}</span></td>"
+            f"<td><code>{html.escape(str(item.get('line', '')))}</code></td>"
+            "<td>"
+            "<details class=\"inline-case\">"
+            "<summary>"
+            f"<span class=\"case-title\">{html.escape(str(item.get('label', '')))} 详细log</span>"
+            f"<span class=\"case-count\">{detail_count} 条关联日志</span>"
+            "</summary>"
+            f"<pre>{html.escape(detail_text)}</pre>"
+            "</details>"
+            "</td>"
+            "</tr>"
+        )
+    item_rows = "\n".join(row_parts)
+    if not item_rows:
+        item_rows = "<tr><td colspan=\"3\" class=\"empty\">未识别到 PASS/FAIL 测试项。</td></tr>"
+
+    raw_text = html.escape(report)
+    title = html.escape(data["title"])
+    log_name_escaped = html.escape(log_name)
+    overview_rows = "".join(
+        f"<div class=\"metric\"><dt>{html.escape(label)}</dt><dd>{html.escape(value)}</dd></div>"
+        for label, value in overview_metrics
+    )
+    alarm_cycle_summary = _extract_alarm_cycle_summary(report)
+    if alarm_cycle_summary:
+        alarm_cycle_rows: list[str] = []
+        for item in alarm_cycle_summary:
+            missing_count = html.escape(str(item["missing_alarm_frames"]))
+            missing_indices = list(item.get("missing_frame_indices") or [])
+            if missing_indices:
+                missing_frames_text = ", ".join(str(frame_idx) for frame_idx in missing_indices)
+                missing_cell = (
+                    "<details class=\"inline-case inline-missing\">"
+                    "<summary>"
+                    f"<span class=\"case-title\">{missing_count}</span>"
+                    "<span class=\"case-count\">点击查看丢失帧</span>"
+                    "</summary>"
+                    f"<pre>{html.escape(missing_frames_text)}</pre>"
+                    "</details>"
+                )
+            else:
+                missing_cell = missing_count
+            alarm_cycle_rows.append(
+                "<tr>"
+                f"<td>{html.escape(item['cycle_index'])}</td>"
+                f"<td>{html.escape(item['track_frames'])}</td>"
+                f"<td>{html.escape(item['first_alarm_frame'])}</td>"
+                f"<td>{html.escape(item['earliest_alarm_distance'])}</td>"
+                f"<td>{missing_cell}</td>"
+                f"<td><span class=\"status {item['status'].lower()}\">{html.escape(item['status'])}</span></td>"
+                "</tr>"
+            )
+        alarm_cycle_section = f"""
+    <table>
+      <caption>报警周期汇总</caption>
+      <thead><tr><th>周期</th><th>跟踪帧范围</th><th>首个报警帧</th><th>最早报警距离</th><th>丢帧数</th><th>结果</th></tr></thead>
+      <tbody>{''.join(alarm_cycle_rows)}</tbody>
+    </table>
+"""
+    else:
+        alarm_cycle_section = ""
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #1f2933;
+      --muted: #667085;
+      --line: #d9dee7;
+      --pass: #0f7b3f;
+      --pass-bg: #e8f6ee;
+      --fail: #b42318;
+      --fail-bg: #fdeceb;
+      --info: #245b88;
+      --info-bg: #e9f2f9;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }}
+    .page {{
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    header {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: end;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 16px;
+      margin-bottom: 18px;
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }}
+    .subtle {{ color: var(--muted); }}
+    .status {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 56px;
+      min-height: 26px;
+      padding: 2px 10px;
+      border-radius: 6px;
+      font-weight: 700;
+      letter-spacing: 0;
+      border: 1px solid transparent;
+    }}
+    .status.pass {{ color: var(--pass); background: var(--pass-bg); border-color: #a8dec0; }}
+    .status.fail {{ color: var(--fail); background: var(--fail-bg); border-color: #f1b5b2; }}
+    .status.unknown {{ color: var(--info); background: var(--info-bg); border-color: #b9d3e8; }}
+    .overview {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }}
+    .metric dt {{ color: var(--muted); margin-bottom: 6px; }}
+    .metric dd {{ margin: 0; font-size: 22px; font-weight: 700; }}
+    .meta {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 14px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 18px;
+    }}
+    .meta-row {{ display: grid; grid-template-columns: 128px 1fr; gap: 10px; min-width: 0; }}
+    .meta dt {{ color: var(--muted); }}
+    .meta dd {{ margin: 0; overflow-wrap: anywhere; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    caption {{
+      text-align: left;
+      font-size: 18px;
+      font-weight: 650;
+      margin: 0 0 10px;
+    }}
+    th, td {{
+      text-align: left;
+      vertical-align: top;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    th {{
+      color: var(--muted);
+      background: #f9fafb;
+      font-weight: 650;
+    }}
+    tr:last-child td {{ border-bottom: 0; }}
+    code, pre {{
+      font-family: Consolas, "Courier New", monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }}
+    details {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-top: 16px;
+    }}
+    .inline-case {{
+      margin: 0;
+      border: 0;
+      background: transparent;
+    }}
+    .inline-case summary {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 0;
+    }}
+    .case-title {{
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }}
+    .case-count {{
+      color: var(--muted);
+      font-weight: 500;
+      white-space: nowrap;
+    }}
+    .inline-case pre {{
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfe;
+    }}
+    summary {{
+      cursor: pointer;
+      padding: 12px 14px;
+      font-weight: 650;
+      color: var(--text);
+    }}
+    pre {{
+      margin: 0;
+      padding: 0 14px 14px;
+      color: #344054;
+      max-height: 520px;
+      overflow: auto;
+    }}
+    .empty {{ color: var(--muted); }}
+    @media (max-width: 760px) {{
+      .page {{ padding: 14px; }}
+      header, .overview, .meta {{ grid-template-columns: 1fr; }}
+      .meta-row {{ grid-template-columns: 1fr; gap: 2px; }}
+      .inline-case summary {{ grid-template-columns: 1fr; gap: 6px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>{title}</h1>
+        <div class="subtle">来源日志：{log_name_escaped} · HTML生成时间：{html.escape(generated_at)}</div>
+      </div>
+      <span class="status {overall_status.lower()}">{html.escape(overall_status)}</span>
+    </header>
+
+    <dl class="overview">
+      {overview_rows}
+    </dl>
+
+    <dl class="meta">{metadata_rows}</dl>
+
+    {alarm_cycle_section}
+
+    <table>
+      <caption>测试项结果</caption>
+      <thead><tr><th>结果</th><th>初步结论</th><th>详细log</th></tr></thead>
+      <tbody>{item_rows}</tbody>
+    </table>
+
+    <details>
+      <summary>展开完整原始日志（备查）</summary>
+      <pre>{raw_text}</pre>
+    </details>
+  </main>
+</body>
+</html>
+"""
+
+
+def write_html_report_for_log(log_path: Path, report: str) -> Path:
+    html_path = log_path.with_suffix(".html")
+    html_path.write_text(build_html_report(report, log_path.name), encoding="utf-8-sig")
+    return html_path
+
+
 def write_receding_recording_log(
     frame_path: Path,
     profile: BrandProfile,
@@ -2535,7 +3262,9 @@ def write_receding_recording_log(
         log_path = frame_path.parent / f"{base_name}_{suffix}.log"
         suffix += 1
 
-    log_path.write_text(repair_report_mojibake(report), encoding="utf-8-sig")
+    repaired_report = repair_report_mojibake(report)
+    log_path.write_text(repaired_report, encoding="utf-8-sig")
+    write_html_report_for_log(log_path, repaired_report)
     return log_path
 
 
@@ -2552,6 +3281,8 @@ def build_approaching_recording_report(
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     track_build_frame_limit = dynamic_track_build_frame_limit(scenario)
     angle_tolerance = dynamic_angle_tolerance(scenario)
+    target_angle = dynamic_target_angle(scenario)
+    angle_source = scenario.get("dynamic_angle_source", "configured" if "angle" in scenario else "default")
     lines = [
         "=" * 60,
         "目标接近分析 | Approaching Target Analysis",
@@ -2563,7 +3294,7 @@ def build_approaching_recording_report(
         f"场景编号 | Scenario ID: {selection_tag(selection)}",
         f"场景说明 | Scenario: {scenario.get('desc', 'N/A')}",
         "判定说明 | Criteria: 接近动态目标轨迹摘要 | approaching dynamic target track summary",
-        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ tolerance=+/-{angle_tolerance}rad",
+        f"动态点匹配 | Dynamic point matching: target_speed={scenario.get('speed')}m/s, AngleAZ center={target_angle}rad ({angle_source}), tolerance=+/-{angle_tolerance}rad",
         f"建航时间检查 | Track-build check: 点云首次出现后 {track_build_frame_limit} 帧内应生成 object | object should appear within {track_build_frame_limit} frames after point-cloud target first appears",
         "点云数量检查 | Point-count check: 点云数量应等于虚拟目标数 + 1 个金属目标 | point count should equal virtual target count + 1 metal target",
     ]
@@ -2697,30 +3428,55 @@ def analyze_receding_recording(
 
     frames = parse_frames(frame_path)
     angle_tolerance = dynamic_angle_tolerance(scenario)
+    target_angle = dynamic_target_angle(scenario)
+    angle_source = "configured" if "angle" in scenario else "default"
+    start_range_max = max(5.0, float(scenario["r_start"]) + 3.0)
+    finder_kwargs = {
+        "target_speed": float(scenario["speed"]),
+        "velocity_tolerance": 2.0,
+        "angle_tolerance": angle_tolerance,
+        "start_range_max": start_range_max,
+        "expected_range_step": abs(float(scenario["speed"])) * 0.1,
+        "range_prediction_tolerance": 4.0,
+        "loss_gap_frames": 3,
+        "min_detections": 8,
+        "require_complete_cycle": True,
+        "angle_unit": "rad" if profile.key == "xiaoniu" else "deg",
+    }
     tracks = find_receding_target_tracks(
         frames,
-        target_speed=float(scenario["speed"]),
-        velocity_tolerance=2.0,
-        angle_tolerance=angle_tolerance,
-        start_range_max=max(5.0, float(scenario["r_start"]) + 3.0),
-        expected_range_step=abs(float(scenario["speed"])) * 0.1,
-        range_prediction_tolerance=4.0,
-        loss_gap_frames=3,
-        min_detections=8,
-        require_complete_cycle=True,
-        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+        target_angle=target_angle,
+        **finder_kwargs,
     )
+    if not tracks and "angle" not in scenario:
+        candidate_centers = _candidate_dynamic_angle_centers(
+            frames,
+            target_speed=float(scenario["speed"]),
+            velocity_tolerance=2.0,
+            range_predicate=lambda range_m: range_m <= start_range_max,
+        )
+        inferred_tracks, inferred_angle = _select_angle_centered_tracks(
+            find_receding_target_tracks,
+            frames,
+            candidate_centers=candidate_centers,
+            finder_kwargs=finder_kwargs,
+        )
+        if inferred_angle is not None:
+            tracks = inferred_tracks
+            target_angle = inferred_angle
+            angle_source = "auto"
+    analysis_scenario = {**scenario, "angle": target_angle, "dynamic_angle_source": angle_source}
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
-    result = evaluate_receding_recording(scenario, tracks, point_count_summary)
+    result = evaluate_receding_recording(analysis_scenario, tracks, point_count_summary)
     track_build_result = evaluate_dynamic_track_build(
         tracks,
-        frame_limit=dynamic_track_build_frame_limit(scenario),
+        frame_limit=dynamic_track_build_frame_limit(analysis_scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
     distance_error_result = evaluate_dynamic_distance_errors(
         tracks,
-        scenario,
+        analysis_scenario,
         angle_unit="rad" if profile.key == "xiaoniu" else "deg",
     )
     result["overall_pass"] = result["overall_pass"] and distance_error_result["longitudinal_pass"] and distance_error_result["velocity_pass"]
@@ -2732,7 +3488,7 @@ def analyze_receding_recording(
         frame_path,
         profile,
         selection,
-        scenario,
+        analysis_scenario,
         tracks,
         point_count_summary,
         alarm_summary,
@@ -2763,19 +3519,44 @@ def analyze_approaching_recording(
 
     frames = parse_frames(frame_path)
     angle_tolerance = dynamic_angle_tolerance(scenario)
+    target_angle = dynamic_target_angle(scenario)
+    angle_source = "configured" if "angle" in scenario else "default"
+    start_range_min = float(scenario.get("start_range_min", max(10.0, float(scenario["r_start"]) - 5.0)))
+    finder_kwargs = {
+        "target_speed": float(scenario["speed"]),
+        "velocity_tolerance": 3.0,
+        "angle_tolerance": angle_tolerance,
+        "start_range_min": start_range_min,
+        "expected_range_step": abs(float(scenario["speed"])) * 0.1,
+        "range_prediction_tolerance": 4.0,
+        "loss_gap_frames": 3,
+        "min_detections": 8,
+        "require_complete_cycle": True,
+        "angle_unit": "rad" if profile.key == "xiaoniu" else "deg",
+    }
     tracks = find_approaching_target_tracks(
         frames,
-        target_speed=float(scenario["speed"]),
-        velocity_tolerance=3.0,
-        angle_tolerance=angle_tolerance,
-        start_range_min=float(scenario.get("start_range_min", max(10.0, float(scenario["r_start"]) - 5.0))),
-        expected_range_step=abs(float(scenario["speed"])) * 0.1,
-        range_prediction_tolerance=4.0,
-        loss_gap_frames=3,
-        min_detections=8,
-        require_complete_cycle=True,
-        angle_unit="rad" if profile.key == "xiaoniu" else "deg",
+        target_angle=target_angle,
+        **finder_kwargs,
     )
+    if not tracks and "angle" not in scenario:
+        candidate_centers = _candidate_dynamic_angle_centers(
+            frames,
+            target_speed=float(scenario["speed"]),
+            velocity_tolerance=3.0,
+            range_predicate=lambda range_m: range_m >= start_range_min,
+        )
+        inferred_tracks, inferred_angle = _select_angle_centered_tracks(
+            find_approaching_target_tracks,
+            frames,
+            candidate_centers=candidate_centers,
+            finder_kwargs=finder_kwargs,
+        )
+        if inferred_angle is not None:
+            tracks = inferred_tracks
+            target_angle = inferred_angle
+            angle_source = "auto"
+    analysis_scenario = {**scenario, "angle": target_angle, "dynamic_angle_source": angle_source}
     point_count_summary = analyze_expected_point_count(frames, expected_point_count=2)
     alarm_summary = summarize_alarm_events_for_tracks(tracks, frames) if tracks else {"alarm_events": [], "alarm_event_count": 0}
     alarm_continuity_result = evaluate_approaching_alarm_continuity(tracks, frames) if tracks else {
@@ -2790,12 +3571,12 @@ def analyze_approaching_recording(
     }
     track_build_result = evaluate_dynamic_track_build(
         tracks,
-        frame_limit=dynamic_track_build_frame_limit(scenario),
+        frame_limit=dynamic_track_build_frame_limit(analysis_scenario),
     )
     continuity_result = evaluate_dynamic_point_continuity(tracks)
     distance_error_result = evaluate_dynamic_distance_errors(
         tracks,
-        scenario,
+        analysis_scenario,
         angle_unit="rad" if profile.key == "xiaoniu" else "deg",
     )
 
@@ -2804,7 +3585,7 @@ def analyze_approaching_recording(
         frame_path,
         profile,
         selection,
-        scenario,
+        analysis_scenario,
         tracks,
         point_count_summary,
         main_alarm_summary,
@@ -2836,7 +3617,7 @@ def analyze_approaching_recording(
         prefix="approaching_target_analysis",
     )
     print(f"[INFO] Saved approaching-target log: {log_path}")
-    alarm_report = build_approaching_alarm_report(frame_path, profile, selection, scenario, alarm_continuity_result)
+    alarm_report = build_approaching_alarm_report(frame_path, profile, selection, analysis_scenario, alarm_continuity_result)
     alarm_log_path = write_receding_recording_log(
         frame_path,
         profile,
@@ -3018,7 +3799,7 @@ def analyze_m1_resolution(
             print(warning)
             search_warnings.append(warning)
             try:
-                main_win = prepare_recording_tool()
+                main_win = prepare_recording_tool(profile)
                 print("[INFO] Reinitialized recording tool for the next M1 iteration.")
             except Exception as prep_exc:
                 print(f"[WARN] Failed to reinitialize recording tool after M1 iteration error: {prep_exc}")
@@ -3172,7 +3953,7 @@ def analyze_m2_speed_resolution(
             print(warning)
             search_warnings.append(warning)
             try:
-                main_win = prepare_recording_tool()
+                main_win = prepare_recording_tool(profile)
                 print("[INFO] Reinitialized recording tool for the next M2 iteration.")
             except Exception as prep_exc:
                 print(f"[WARN] Failed to reinitialize recording tool after M2 iteration error: {prep_exc}")
@@ -3333,7 +4114,7 @@ def manual_loop(sim: RadarTargetSimulator) -> None:
 def automation_loop(sim: RadarTargetSimulator, seconds: int) -> None:
     from radar_recording import prepare_recording_tool, record_once
 
-    main_win = prepare_recording_tool()
+    main_win = prepare_recording_tool(sim.profile)
     while True:
         selection = choose_scenario(sim.profile)
         if selection is None:

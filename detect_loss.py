@@ -1803,6 +1803,7 @@ def find_receding_target_tracks(
     frames,
     target_speed=10.0,
     velocity_tolerance=2.0,
+    target_angle=0.0,
     angle_tolerance=0.25,
     start_range_max=5.0,
     expected_range_step=1.0,
@@ -1820,7 +1821,7 @@ def find_receding_target_tracks(
             point
             for point in frame.get("points", [])
             if abs(point.velocity - target_speed) <= velocity_tolerance
-            and abs(point.angle_az) <= angle_tolerance
+            and abs(point.angle_az - target_angle) <= angle_tolerance
         ]
         points.sort(key=lambda point: point.range_m)
         used_points = set()
@@ -1928,6 +1929,7 @@ def find_approaching_target_tracks(
     frames,
     target_speed=-10.0,
     velocity_tolerance=3.0,
+    target_angle=0.0,
     angle_tolerance=0.25,
     start_range_min=10.0,
     expected_range_step=1.0,
@@ -1945,7 +1947,7 @@ def find_approaching_target_tracks(
             point
             for point in frame.get("points", [])
             if abs(point.velocity - target_speed) <= velocity_tolerance
-            and abs(point.angle_az) <= angle_tolerance
+            and abs(point.angle_az - target_angle) <= angle_tolerance
         ]
         points.sort(key=lambda point: point.range_m, reverse=True)
         used_points = set()
